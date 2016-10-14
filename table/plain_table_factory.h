@@ -14,7 +14,6 @@
 
 namespace rocksdb {
 
-struct Options;
 struct EnvOptions;
 
 using std::unique_ptr;
@@ -128,7 +127,7 @@ class TableBuilder;
 class PlainTableFactory : public TableFactory {
  public:
   ~PlainTableFactory() {}
-  // user_key_size is the length of the user key. If it is set to be
+  // user_key_len is the length of the user key. If it is set to be
   // kPlainTableVariableLength, then it means variable length. Otherwise, all
   // the keys need to have the fix length of this value. bloom_bits_per_key is
   // number of bits used for bloom filer per key. hash_table_ratio is
@@ -143,41 +142,36 @@ class PlainTableFactory : public TableFactory {
   // huge_page_tlb_size determines whether to allocate hash indexes from huge
   // page TLB and the page size if allocating from there. See comments of
   // Arena::AllocateAligned() for details.
-  explicit PlainTableFactory(uint32_t user_key_len = kPlainTableVariableLength,
-                             int bloom_bits_per_key = 0,
-                             double hash_table_ratio = 0.75,
-                             size_t index_sparseness = 16,
-                             size_t huge_page_tlb_size = 0,
-                             EncodingType encoding_type = kPlain,
-                             bool full_scan_mode = false)
-      : user_key_len_(user_key_len),
-        bloom_bits_per_key_(bloom_bits_per_key),
-        hash_table_ratio_(hash_table_ratio),
-        index_sparseness_(index_sparseness),
-        huge_page_tlb_size_(huge_page_tlb_size),
-        encoding_type_(encoding_type),
-        full_scan_mode_(full_scan_mode) {}
-  const char* Name() const override { return "PlainTable"; }
-  Status NewTableReader(const Options& options, const EnvOptions& soptions,
-                        const InternalKeyComparator& internal_comparator,
-                        unique_ptr<RandomAccessFile>&& file, uint64_t file_size,
-                        unique_ptr<TableReader>* table) const override;
-  TableBuilder* NewTableBuilder(const Options& options,
-                                const InternalKeyComparator& icomparator,
-                                WritableFile* file,
-                                CompressionType compression_type) const
-      override;
+  explicit PlainTableFactory(
+      const PlainTableOptions& _table_options = PlainTableOptions())
+      : table_options_(_table_options) {}
 
-  static const char kValueTypeSeqId0 = 0xFF;
+  const char* Name() const override { return "PlainTable"; }
+  Status NewTableReader(const TableReaderOptions& table_reader_options,
+                        unique_ptr<RandomAccessFileReader>&& file,
+                        uint64_t file_size, unique_ptr<TableReader>* table,
+                        bool prefetch_index_and_filter_in_cache) const override;
+
+  TableBuilder* NewTableBuilder(
+      const TableBuilderOptions& table_builder_options,
+      uint32_t column_family_id, WritableFileWriter* file) const override;
+
+  std::string GetPrintableTableOptions() const override;
+
+  const PlainTableOptions& table_options() const;
+
+  static const char kValueTypeSeqId0 = char(0xFF);
+
+  // Sanitizes the specified DB Options.
+  Status SanitizeOptions(const DBOptions& db_opts,
+                         const ColumnFamilyOptions& cf_opts) const override {
+    return Status::OK();
+  }
+
+  void* GetOptions() override { return &table_options_; }
 
  private:
-  uint32_t user_key_len_;
-  int bloom_bits_per_key_;
-  double hash_table_ratio_;
-  size_t index_sparseness_;
-  size_t huge_page_tlb_size_;
-  EncodingType encoding_type_;
-  bool full_scan_mode_;
+  PlainTableOptions table_options_;
 };
 
 }  // namespace rocksdb

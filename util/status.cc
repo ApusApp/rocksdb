@@ -1,4 +1,4 @@
-//  Copyright (c) 2013, Facebook, Inc.  All rights reserved.
+//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
 //  This source code is licensed under the BSD-style license found in the
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
@@ -21,11 +21,12 @@ const char* Status::CopyState(const char* state) {
   return result;
 }
 
-Status::Status(Code code, const Slice& msg, const Slice& msg2) :
-    code_(code) {
-  assert(code != kOk);
-  const uint32_t len1 = msg.size();
-  const uint32_t len2 = msg2.size();
+Status::Status(Code _code, SubCode _subcode, const Slice& msg, const Slice& msg2)
+    : code_(_code), subcode_(_subcode) {
+  assert(code_ != kOk);
+  assert(subcode_ != kMaxSubCode);
+  const uint32_t len1 = static_cast<uint32_t>(msg.size());
+  const uint32_t len2 = static_cast<uint32_t>(msg2.size());
   const uint32_t size = len1 + (len2 ? (2 + len2) : 0);
   char* result = new char[size + 4];
   memcpy(result, &size, sizeof(size));
@@ -68,6 +69,21 @@ std::string Status::ToString() const {
     case kShutdownInProgress:
       type = "Shutdown in progress: ";
       break;
+    case kTimedOut:
+      type = "Operation timed out: ";
+      break;
+    case kAborted:
+      type = "Operation aborted: ";
+      break;
+    case kBusy:
+      type = "Resource busy: ";
+      break;
+    case kExpired:
+      type = "Operation expired: ";
+      break;
+    case kTryAgain:
+      type = "Operation failed. Try again.: ";
+      break;
     default:
       snprintf(tmp, sizeof(tmp), "Unknown code(%d): ",
                static_cast<int>(code()));
@@ -75,6 +91,12 @@ std::string Status::ToString() const {
       break;
   }
   std::string result(type);
+  if (subcode_ != kNone) {
+    uint32_t index = static_cast<int32_t>(subcode_);
+    assert(sizeof(msgs) > index);
+    result.append(msgs[index]);
+  }
+
   if (state_ != nullptr) {
     uint32_t length;
     memcpy(&length, state_, sizeof(length));
