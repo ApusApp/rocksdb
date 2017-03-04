@@ -30,7 +30,8 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       compaction_options_universal(cf_options.compaction_options_universal),
       compaction_options_fifo(cf_options.compaction_options_fifo),
       prefix_extractor(cf_options.prefix_extractor.get()),
-      comparator(cf_options.comparator),
+      user_comparator(cf_options.comparator),
+      internal_comparator(InternalKeyComparator(cf_options.comparator)),
       merge_operator(cf_options.merge_operator.get()),
       compaction_filter(cf_options.compaction_filter),
       compaction_filter_factory(cf_options.compaction_filter_factory.get()),
@@ -43,7 +44,6 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       info_log(db_options.info_log.get()),
       statistics(db_options.statistics.get()),
       env(db_options.env),
-      delayed_write_rate(db_options.delayed_write_rate),
       allow_mmap_reads(db_options.allow_mmap_reads),
       allow_mmap_writes(db_options.allow_mmap_writes),
       db_paths(db_options.db_paths),
@@ -55,7 +55,6 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       bloom_locality(cf_options.bloom_locality),
       purge_redundant_kvs_while_flush(
           cf_options.purge_redundant_kvs_while_flush),
-      disable_data_sync(db_options.disable_data_sync),
       use_fsync(db_options.use_fsync),
       compression_per_level(cf_options.compression_per_level),
       bottommost_compression(cf_options.bottommost_compression),
@@ -72,21 +71,19 @@ ImmutableCFOptions::ImmutableCFOptions(const ImmutableDBOptions& db_options,
       force_consistency_checks(cf_options.force_consistency_checks),
       listeners(db_options.listeners),
       row_cache(db_options.row_cache),
-      max_subcompactions(db_options.max_subcompactions) {}
+      max_subcompactions(db_options.max_subcompactions),
+      memtable_insert_with_hint_prefix_extractor(
+          cf_options.memtable_insert_with_hint_prefix_extractor.get()) {}
 
 // Multiple two operands. If they overflow, return op1.
-uint64_t MultiplyCheckOverflow(uint64_t op1, int op2) {
-  if (op1 == 0) {
+uint64_t MultiplyCheckOverflow(uint64_t op1, double op2) {
+  if (op1 == 0 || op2 <= 0) {
     return 0;
   }
-  if (op2 <= 0) {
+  if (port::kMaxUint64 / op1 < op2) {
     return op1;
   }
-  uint64_t casted_op2 = (uint64_t) op2;
-  if (std::numeric_limits<uint64_t>::max() / op1 < casted_op2) {
-    return op1;
-  }
-  return op1 * casted_op2;
+  return static_cast<uint64_t>(op1 * op2);
 }
 
 void MutableCFOptions::RefreshDerivedOptions(int num_levels,
@@ -146,7 +143,7 @@ void MutableCFOptions::Dump(Logger* log) const {
       target_file_size_multiplier);
   Log(log, "                 max_bytes_for_level_base: %" PRIu64,
       max_bytes_for_level_base);
-  Log(log, "           max_bytes_for_level_multiplier: %d",
+  Log(log, "           max_bytes_for_level_multiplier: %f",
       max_bytes_for_level_multiplier);
   std::string result;
   char buf[10];
@@ -161,8 +158,6 @@ void MutableCFOptions::Dump(Logger* log) const {
   }
 
   Log(log, "max_bytes_for_level_multiplier_additional: %s", result.c_str());
-  Log(log, "           verify_checksums_in_compaction: %d",
-      verify_checksums_in_compaction);
   Log(log, "        max_sequential_skip_in_iterations: %" PRIu64,
       max_sequential_skip_in_iterations);
   Log(log, "                     paranoid_file_checks: %d",
@@ -170,8 +165,6 @@ void MutableCFOptions::Dump(Logger* log) const {
   Log(log, "                       report_bg_io_stats: %d", report_bg_io_stats);
   Log(log, "                              compression: %d",
       static_cast<int>(compression));
-  Log(log, "               min_partial_merge_operands: %" PRIu32,
-      min_partial_merge_operands);
 }
 
 }  // namespace rocksdb

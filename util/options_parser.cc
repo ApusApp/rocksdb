@@ -510,7 +510,7 @@ bool AreEqualOptions(
     const std::unordered_map<std::string, std::string>* opt_map) {
   const char* offset1 = opt1 + type_info.offset;
   const char* offset2 = opt2 + type_info.offset;
-  static const std::string kNullptrString = "nullptr";
+
   switch (type_info.type) {
     case OptionType::kBoolean:
       return (*reinterpret_cast<const bool*>(offset1) ==
@@ -542,6 +542,9 @@ bool AreEqualOptions(
     case OptionType::kCompactionStyle:
       return (*reinterpret_cast<const CompactionStyle*>(offset1) ==
               *reinterpret_cast<const CompactionStyle*>(offset2));
+    case OptionType::kCompactionPri:
+      return (*reinterpret_cast<const CompactionPri*>(offset1) ==
+              *reinterpret_cast<const CompactionPri*>(offset2));
     case OptionType::kCompressionType:
       return (*reinterpret_cast<const CompressionType*>(offset1) ==
               *reinterpret_cast<const CompressionType*>(offset2));

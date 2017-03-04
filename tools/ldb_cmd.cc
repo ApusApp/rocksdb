@@ -21,7 +21,7 @@
 #include "rocksdb/cache.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/utilities/backupable_db.h"
-#include "rocksdb/utilities/env_registry.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
@@ -34,12 +34,13 @@
 
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <fstream>
 
 namespace rocksdb {
 
@@ -167,6 +168,10 @@ LDBCommand* LDBCommand::SelectCommand(const ParsedParams& parsed_params) {
   } else if (parsed_params.cmd == DeleteCommand::Name()) {
     return new DeleteCommand(parsed_params.cmd_params, parsed_params.option_map,
                              parsed_params.flags);
+  } else if (parsed_params.cmd == DeleteRangeCommand::Name()) {
+    return new DeleteRangeCommand(parsed_params.cmd_params,
+                                  parsed_params.option_map,
+                                  parsed_params.flags);
   } else if (parsed_params.cmd == ApproxSizeCommand::Name()) {
     return new ApproxSizeCommand(parsed_params.cmd_params,
                                  parsed_params.option_map, parsed_params.flags);
@@ -775,7 +780,7 @@ void CompactorCommand::DoCommand() {
   CompactRangeOptions cro;
   cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
 
-  db_->CompactRange(cro, begin, end);
+  db_->CompactRange(cro, GetCfHandle(), begin, end);
   exec_state_ = LDBCommandExecuteResult::Succeed("");
 
   delete begin;
@@ -1183,7 +1188,9 @@ void InternalDumpCommand::DoCommand() {
   uint64_t s1=0,s2=0;
   // Setup internal key iterator
   Arena arena;
-  ScopedArenaIterator iter(idb->NewInternalIterator(&arena));
+  auto icmp = InternalKeyComparator(options_.comparator);
+  RangeDelAggregator range_del_agg(icmp, {} /* snapshots */);
+  ScopedArenaIterator iter(idb->NewInternalIterator(&arena, &range_del_agg));
   Status st = iter->status();
   if (!st.ok()) {
     exec_state_ =
@@ -1763,7 +1770,7 @@ void ChangeCompactionStyleCommand::DoCommand() {
   // verify compaction result
   files_per_level = "";
   int num_files = 0;
-  for (int i = 0; i < db_->NumberLevels(); i++) {
+  for (int i = 0; i < db_->NumberLevels(GetCfHandle()); i++) {
     db_->GetProperty(GetCfHandle(),
                      "rocksdb.num-files-at-level" + NumberToString(i),
                      &property);
@@ -1849,6 +1856,14 @@ class InMemoryHandler : public WriteBatch::Handler {
   virtual Status SingleDeleteCF(uint32_t cf, const Slice& key) override {
     row_ << "SINGLE_DELETE(" << cf << ") : ";
     row_ << LDBCommand::StringToHex(key.ToString()) << " ";
+    return Status::OK();
+  }
+
+  virtual Status DeleteRangeCF(uint32_t cf, const Slice& begin_key,
+                               const Slice& end_key) override {
+    row_ << "DELETE_RANGE(" << cf << ") : ";
+    row_ << LDBCommand::StringToHex(begin_key.ToString()) << " ";
+    row_ << LDBCommand::StringToHex(end_key.ToString()) << " ";
     return Status::OK();
   }
 
@@ -2344,6 +2359,45 @@ void DeleteCommand::DoCommand() {
   }
 }
 
+DeleteRangeCommand::DeleteRangeCommand(
+    const std::vector<std::string>& params,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, false,
+                 BuildCmdLineOptions({ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX})) {
+  if (params.size() != 2) {
+    exec_state_ = LDBCommandExecuteResult::Failed(
+        "begin and end keys must be specified for the delete command");
+  } else {
+    begin_key_ = params.at(0);
+    end_key_ = params.at(1);
+    if (is_key_hex_) {
+      begin_key_ = HexToString(begin_key_);
+      end_key_ = HexToString(end_key_);
+    }
+  }
+}
+
+void DeleteRangeCommand::Help(std::string& ret) {
+  ret.append("  ");
+  ret.append(DeleteRangeCommand::Name() + " <begin key> <end key>");
+  ret.append("\n");
+}
+
+void DeleteRangeCommand::DoCommand() {
+  if (!db_) {
+    assert(GetExecuteState().IsFailed());
+    return;
+  }
+  Status st =
+      db_->DeleteRange(WriteOptions(), GetCfHandle(), begin_key_, end_key_);
+  if (st.ok()) {
+    fprintf(stdout, "OK\n");
+  } else {
+    exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
+  }
+}
+
 PutCommand::PutCommand(const std::vector<std::string>& params,
                        const std::map<std::string, std::string>& options,
                        const std::vector<std::string>& flags)
@@ -2534,41 +2588,69 @@ void RepairCommand::DoCommand() {
 
 // ----------------------------------------------------------------------------
 
-const std::string BackupCommand::ARG_THREAD = "num_threads";
-const std::string BackupCommand::ARG_BACKUP_ENV = "backup_env_uri";
-const std::string BackupCommand::ARG_BACKUP_DIR = "backup_dir";
+const std::string BackupableCommand::ARG_NUM_THREADS = "num_threads";
+const std::string BackupableCommand::ARG_BACKUP_ENV_URI = "backup_env_uri";
+const std::string BackupableCommand::ARG_BACKUP_DIR = "backup_dir";
+const std::string BackupableCommand::ARG_STDERR_LOG_LEVEL = "stderr_log_level";
 
-BackupCommand::BackupCommand(const std::vector<std::string>& params,
-                             const std::map<std::string, std::string>& options,
-                             const std::vector<std::string>& flags)
-    : LDBCommand(
-          options, flags, false,
-          BuildCmdLineOptions({ARG_BACKUP_ENV, ARG_BACKUP_DIR, ARG_THREAD})),
-      thread_num_(1) {
-  auto itr = options.find(ARG_THREAD);
+BackupableCommand::BackupableCommand(
+    const std::vector<std::string>& params,
+    const std::map<std::string, std::string>& options,
+    const std::vector<std::string>& flags)
+    : LDBCommand(options, flags, false /* is_read_only */,
+                 BuildCmdLineOptions({ARG_BACKUP_ENV_URI, ARG_BACKUP_DIR,
+                                      ARG_NUM_THREADS, ARG_STDERR_LOG_LEVEL})),
+      num_threads_(1) {
+  auto itr = options.find(ARG_NUM_THREADS);
   if (itr != options.end()) {
-    thread_num_ = std::stoi(itr->second);
+    num_threads_ = std::stoi(itr->second);
   }
-  itr = options.find(ARG_BACKUP_ENV);
+  itr = options.find(ARG_BACKUP_ENV_URI);
   if (itr != options.end()) {
-    test_cluster_ = itr->second;
+    backup_env_uri_ = itr->second;
   }
   itr = options.find(ARG_BACKUP_DIR);
   if (itr == options.end()) {
     exec_state_ = LDBCommandExecuteResult::Failed("--" + ARG_BACKUP_DIR +
                                                   ": missing backup directory");
   } else {
-    test_path_ = itr->second;
+    backup_dir_ = itr->second;
+  }
+
+  itr = options.find(ARG_STDERR_LOG_LEVEL);
+  if (itr != options.end()) {
+    int stderr_log_level = std::stoi(itr->second);
+    if (stderr_log_level < 0 ||
+        stderr_log_level >= InfoLogLevel::NUM_INFO_LOG_LEVELS) {
+      exec_state_ = LDBCommandExecuteResult::Failed(
+          ARG_STDERR_LOG_LEVEL + " must be >= 0 and < " +
+          std::to_string(InfoLogLevel::NUM_INFO_LOG_LEVELS) + ".");
+    } else {
+      logger_.reset(
+          new StderrLogger(static_cast<InfoLogLevel>(stderr_log_level)));
+    }
   }
 }
 
-void BackupCommand::Help(std::string& ret) {
+void BackupableCommand::Help(const std::string& name, std::string& ret) {
   ret.append("  ");
-  ret.append(BackupCommand::Name());
-  ret.append(" [--" + ARG_BACKUP_ENV + "] ");
+  ret.append(name);
+  ret.append(" [--" + ARG_BACKUP_ENV_URI + "] ");
   ret.append(" [--" + ARG_BACKUP_DIR + "] ");
-  ret.append(" [--" + ARG_THREAD + "] ");
+  ret.append(" [--" + ARG_NUM_THREADS + "] ");
+  ret.append(" [--" + ARG_STDERR_LOG_LEVEL + "=<int (InfoLogLevel)>] ");
   ret.append("\n");
+}
+
+// ----------------------------------------------------------------------------
+
+BackupCommand::BackupCommand(const std::vector<std::string>& params,
+                             const std::map<std::string, std::string>& options,
+                             const std::vector<std::string>& flags)
+    : BackupableCommand(params, options, flags) {}
+
+void BackupCommand::Help(std::string& ret) {
+  BackupableCommand::Help(Name(), ret);
 }
 
 void BackupCommand::DoCommand() {
@@ -2580,10 +2662,11 @@ void BackupCommand::DoCommand() {
   }
   printf("open db OK\n");
   std::unique_ptr<Env> custom_env_guard;
-  Env* custom_env = NewEnvFromUri(test_cluster_, &custom_env_guard);
+  Env* custom_env = NewCustomObject<Env>(backup_env_uri_, &custom_env_guard);
   BackupableDBOptions backup_options =
-      BackupableDBOptions(test_path_, custom_env);
-  backup_options.max_background_operations = thread_num_;
+      BackupableDBOptions(backup_dir_, custom_env);
+  backup_options.info_log = logger_.get();
+  backup_options.max_background_operations = num_threads_;
   status = BackupEngine::Open(Env::Default(), backup_options, &backup_engine);
   if (status.ok()) {
     printf("open backup engine OK\n");
@@ -2602,51 +2685,24 @@ void BackupCommand::DoCommand() {
 
 // ----------------------------------------------------------------------------
 
-const std::string RestoreCommand::ARG_BACKUP_ENV_URI = "backup_env_uri";
-const std::string RestoreCommand::ARG_BACKUP_DIR = "backup_dir";
-const std::string RestoreCommand::ARG_NUM_THREADS = "num_threads";
-
 RestoreCommand::RestoreCommand(
     const std::vector<std::string>& params,
     const std::map<std::string, std::string>& options,
     const std::vector<std::string>& flags)
-    : LDBCommand(options, flags, false /* is_read_only */,
-                 BuildCmdLineOptions(
-                     {ARG_BACKUP_ENV_URI, ARG_BACKUP_DIR, ARG_NUM_THREADS})),
-      num_threads_(1) {
-  auto itr = options.find(ARG_NUM_THREADS);
-  if (itr != options.end()) {
-    num_threads_ = std::stoi(itr->second);
-  }
-  itr = options.find(ARG_BACKUP_ENV_URI);
-  if (itr != options.end()) {
-    backup_env_uri_ = itr->second;
-  }
-  itr = options.find(ARG_BACKUP_DIR);
-  if (itr == options.end()) {
-    exec_state_ = LDBCommandExecuteResult::Failed("--" + ARG_BACKUP_DIR +
-                                                  ": missing backup directory");
-  } else {
-    backup_dir_ = itr->second;
-  }
-}
+    : BackupableCommand(params, options, flags) {}
 
 void RestoreCommand::Help(std::string& ret) {
-  ret.append("  ");
-  ret.append(RestoreCommand::Name());
-  ret.append(" [--" + ARG_BACKUP_ENV_URI + "] ");
-  ret.append(" [--" + ARG_BACKUP_DIR + "] ");
-  ret.append(" [--" + ARG_NUM_THREADS + "] ");
-  ret.append("\n");
+  BackupableCommand::Help(Name(), ret);
 }
 
 void RestoreCommand::DoCommand() {
   std::unique_ptr<Env> custom_env_guard;
-  Env* custom_env = NewEnvFromUri(backup_env_uri_, &custom_env_guard);
+  Env* custom_env = NewCustomObject<Env>(backup_env_uri_, &custom_env_guard);
   std::unique_ptr<BackupEngineReadOnly> restore_engine;
   Status status;
   {
     BackupableDBOptions opts(backup_dir_, custom_env);
+    opts.info_log = logger_.get();
     opts.max_background_operations = num_threads_;
     BackupEngineReadOnly* raw_restore_engine_ptr;
     status = BackupEngineReadOnly::Open(Env::Default(), opts,

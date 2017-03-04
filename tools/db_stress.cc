@@ -110,6 +110,8 @@ DEFINE_int32(ttl, -1,
 DEFINE_int32(value_size_mult, 8,
              "Size of value will be this number times rand_int(1,3) bytes");
 
+DEFINE_int32(compaction_readahead_size, 0, "Compaction readahead size");
+
 DEFINE_bool(verify_before_write, false, "Verify before write");
 
 DEFINE_bool(histogram, false, "Print histogram of operation timings");
@@ -270,14 +272,20 @@ DEFINE_bool(verify_checksum, false,
 DEFINE_bool(mmap_read, rocksdb::EnvOptions().use_mmap_reads,
             "Allow reads to occur via mmap-ing files");
 
+DEFINE_bool(mmap_write, rocksdb::EnvOptions().use_mmap_writes,
+            "Allow writes to occur via mmap-ing files");
+
+DEFINE_bool(use_direct_reads, rocksdb::EnvOptions().use_direct_reads,
+            "Use O_DIRECT for reading data");
+
+DEFINE_bool(use_direct_writes, rocksdb::EnvOptions().use_direct_writes,
+            "Use O_DIRECT for writing data");
+
 // Database statistics
 static std::shared_ptr<rocksdb::Statistics> dbstats;
 DEFINE_bool(statistics, false, "Create database statistics");
 
 DEFINE_bool(sync, false, "Sync all writes to disk");
-
-DEFINE_bool(disable_data_sync, false,
-            "If true, do not wait until data is synced to disk.");
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
@@ -303,8 +311,11 @@ DEFINE_int32(target_file_size_multiplier, 1,
 
 DEFINE_uint64(max_bytes_for_level_base, 256 * KB, "Max bytes for level-1");
 
-DEFINE_int32(max_bytes_for_level_multiplier, 2,
-             "A multiplier to compute max bytes for level-N (N >= 2)");
+DEFINE_double(max_bytes_for_level_multiplier, 2,
+              "A multiplier to compute max bytes for level-N (N >= 2)");
+
+DEFINE_int32(range_deletion_width, 10,
+             "The width of the range deletion intervals.");
 
 // Temporarily disable this to allows it to detect new bugs
 DEFINE_int32(compact_files_one_in, 0,
@@ -340,6 +351,12 @@ DEFINE_int32(delpercent, 15,
              "Ratio of deletes to total workload (expressed as a percentage)");
 static const bool FLAGS_delpercent_dummy __attribute__((unused)) =
     RegisterFlagValidator(&FLAGS_delpercent, &ValidateInt32Percent);
+
+DEFINE_int32(delrangepercent, 0,
+             "Ratio of range deletions to total workload (expressed as a "
+             "percentage). Cannot be used with test_batches_snapshots");
+static const bool FLAGS_delrangepercent_dummy __attribute__((unused)) =
+    RegisterFlagValidator(&FLAGS_delrangepercent, &ValidateInt32Percent);
 
 DEFINE_int32(nooverwritepercent, 60,
              "Ratio of keys without overwrite to total workload (expressed as "
@@ -499,6 +516,8 @@ class Stats {
   long iterator_size_sums_;
   long founds_;
   long iterations_;
+  long range_deletions_;
+  long covered_by_range_deletions_;
   long errors_;
   long num_compact_files_succeed_;
   long num_compact_files_failed_;
@@ -522,6 +541,8 @@ class Stats {
     iterator_size_sums_ = 0;
     founds_ = 0;
     iterations_ = 0;
+    range_deletions_ = 0;
+    covered_by_range_deletions_ = 0;
     errors_ = 0;
     bytes_ = 0;
     seconds_ = 0;
@@ -543,6 +564,8 @@ class Stats {
     iterator_size_sums_ += other.iterator_size_sums_;
     founds_ += other.founds_;
     iterations_ += other.iterations_;
+    range_deletions_ += other.range_deletions_;
+    covered_by_range_deletions_ = other.covered_by_range_deletions_;
     errors_ += other.errors_;
     bytes_ += other.bytes_;
     seconds_ += other.seconds_;
@@ -608,6 +631,14 @@ class Stats {
 
   void AddSingleDeletes(size_t n) { single_deletes_ += n; }
 
+  void AddRangeDeletions(int n) {
+    range_deletions_ += n;
+  }
+
+  void AddCoveredByRangeDeletions(int n) {
+    covered_by_range_deletions_ += n;
+  }
+
   void AddErrors(int n) {
     errors_ += n;
   }
@@ -643,6 +674,10 @@ class Stats {
     fprintf(stdout, "%-12s: Iterator size sum is %ld\n", "",
             iterator_size_sums_);
     fprintf(stdout, "%-12s: Iterated %ld times\n", "", iterations_);
+    fprintf(stdout, "%-12s: Deleted %ld key-ranges\n", "", range_deletions_);
+    fprintf(stdout, "%-12s: Range deletions covered %ld keys\n", "",
+            covered_by_range_deletions_);
+
     fprintf(stdout, "%-12s: Got errors %ld times\n", "", errors_);
     fprintf(stdout, "%-12s: %ld CompactFiles() succeed\n", "",
             num_compact_files_succeed_);
@@ -823,6 +858,17 @@ class SharedState {
   void Delete(int cf, int64_t key) { values_[cf][key] = SENTINEL; }
 
   void SingleDelete(int cf, int64_t key) { values_[cf][key] = SENTINEL; }
+
+  int DeleteRange(int cf, int64_t begin_key, int64_t end_key) {
+    int covered = 0;
+    for (int64_t key = begin_key; key < end_key; ++key) {
+      if (values_[cf][key] != SENTINEL) {
+        ++covered;
+      }
+      values_[cf][key] = SENTINEL;
+    }
+    return covered;
+  }
 
   bool AllowsOverwrite(int cf, int64_t key) {
     return no_overwrite_ids_[cf].find(key) == no_overwrite_ids_[cf].end();
@@ -1550,6 +1596,7 @@ class StressTest {
     const int prefixBound = (int)FLAGS_readpercent + (int)FLAGS_prefixpercent;
     const int writeBound = prefixBound + (int)FLAGS_writepercent;
     const int delBound = writeBound + (int)FLAGS_delpercent;
+    const int delRangeBound = delBound + (int)FLAGS_delrangepercent;
 
     thread->stats.Start();
     for (uint64_t i = 0; i < FLAGS_ops_per_thread; i++) {
@@ -1814,6 +1861,47 @@ class StressTest {
         } else {
           MultiDelete(thread, write_opts, column_family, key);
         }
+      } else if (delBound <= prob_op && prob_op < delRangeBound) {
+        // OPERATION delete range
+        if (!FLAGS_test_batches_snapshots) {
+          std::vector<std::unique_ptr<MutexLock>> range_locks;
+          // delete range does not respect disallowed overwrites. the keys for
+          // which overwrites are disallowed are randomly distributed so it
+          // could be expensive to find a range where each key allows
+          // overwrites.
+          if (rand_key > max_key - FLAGS_range_deletion_width) {
+            l.reset();
+            rand_key = thread->rand.Next() %
+                       (max_key - FLAGS_range_deletion_width + 1);
+            range_locks.emplace_back(new MutexLock(
+                shared->GetMutexForKey(rand_column_family, rand_key)));
+          } else {
+            range_locks.emplace_back(std::move(l));
+          }
+          for (int j = 1; j < FLAGS_range_deletion_width; ++j) {
+            if (((rand_key + j) & ((1 << FLAGS_log2_keys_per_lock) - 1)) == 0) {
+              range_locks.emplace_back(new MutexLock(
+                    shared->GetMutexForKey(rand_column_family, rand_key + j)));
+            }
+          }
+
+          keystr = Key(rand_key);
+          key = keystr;
+          column_family = column_families_[rand_column_family];
+          std::string end_keystr = Key(rand_key + FLAGS_range_deletion_width);
+          Slice end_key = end_keystr;
+          int covered = shared->DeleteRange(
+              rand_column_family, rand_key,
+              rand_key + FLAGS_range_deletion_width);
+          Status s = db_->DeleteRange(write_opts, column_family, key, end_key);
+          if (!s.ok()) {
+            fprintf(stderr, "delete range error: %s\n",
+                    s.ToString().c_str());
+            std::terminate();
+          }
+          thread->stats.AddRangeDeletions(1);
+          thread->stats.AddCoveredByRangeDeletions(covered);
+        }
       } else {
         // OPERATION iterate
         MultiIterate(thread, read_opts, column_family, key);
@@ -1987,6 +2075,7 @@ class StressTest {
     fprintf(stdout, "Prefix percentage         : %d%%\n", FLAGS_prefixpercent);
     fprintf(stdout, "Write percentage          : %d%%\n", FLAGS_writepercent);
     fprintf(stdout, "Delete percentage         : %d%%\n", FLAGS_delpercent);
+    fprintf(stdout, "Delete range percentage   : %d%%\n", FLAGS_delrangepercent);
     fprintf(stdout, "No overwrite percentage   : %d%%\n",
             FLAGS_nooverwritepercent);
     fprintf(stdout, "Iterate percentage        : %d%%\n", FLAGS_iterpercent);
@@ -2062,9 +2151,12 @@ class StressTest {
     options_.max_open_files = FLAGS_open_files;
     options_.statistics = dbstats;
     options_.env = FLAGS_env;
-    options_.disableDataSync = FLAGS_disable_data_sync;
     options_.use_fsync = FLAGS_use_fsync;
+    options_.compaction_readahead_size = FLAGS_compaction_readahead_size;
     options_.allow_mmap_reads = FLAGS_mmap_read;
+    options_.allow_mmap_writes = FLAGS_mmap_write;
+    options_.use_direct_reads = FLAGS_use_direct_reads;
+    options_.use_direct_writes = FLAGS_use_direct_writes;
     options_.target_file_size_base = FLAGS_target_file_size_base;
     options_.target_file_size_multiplier = FLAGS_target_file_size_multiplier;
     options_.max_bytes_for_level_base = FLAGS_max_bytes_for_level_base;
@@ -2284,9 +2376,11 @@ int main(int argc, char** argv) {
     exit(1);
   }
   if ((FLAGS_readpercent + FLAGS_prefixpercent +
-       FLAGS_writepercent + FLAGS_delpercent + FLAGS_iterpercent) != 100) {
+       FLAGS_writepercent + FLAGS_delpercent + FLAGS_delrangepercent +
+       FLAGS_iterpercent) != 100) {
       fprintf(stderr,
-              "Error: Read+Prefix+Write+Delete+Iterate percents != 100!\n");
+              "Error: Read+Prefix+Write+Delete+DeleteRange+Iterate percents != "
+              "100!\n");
       exit(1);
   }
   if (FLAGS_disable_wal == 1 && FLAGS_reopen > 0) {
@@ -2300,6 +2394,11 @@ int main(int argc, char** argv) {
               FLAGS_reopen,
               (unsigned long)FLAGS_ops_per_thread);
       exit(1);
+  }
+  if (FLAGS_test_batches_snapshots && FLAGS_delrangepercent > 0) {
+    fprintf(stderr, "Error: nonzero delrangepercent unsupported in "
+                    "test_batches_snapshots mode\n");
+    exit(1);
   }
 
   // Choose a location for the test database if none given with --db=<path>

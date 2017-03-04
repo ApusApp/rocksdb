@@ -155,9 +155,10 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
       "block_size_deviation=8;block_restart_interval=4; "
+      "index_per_partition=4;"
       "index_block_restart_interval=4;"
       "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
-      "skip_table_builder_flush=1;format_version=1;"
+      "format_version=1;"
       "hash_index_allow_collision=false;"
       "verify_compression=true;read_amp_bytes_per_bit=0",
       new_bbto));
@@ -259,21 +260,20 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "is_fd_close_on_exec=false;"
                              "bytes_per_sync=4295013613;"
                              "enable_thread_tracking=false;"
-                             "disable_data_sync=false;"
                              "recycle_log_file_num=0;"
-                             "disableDataSync=false;"
                              "create_missing_column_families=true;"
                              "log_file_time_to_roll=3097;"
                              "max_background_flushes=35;"
                              "create_if_missing=false;"
                              "error_if_exists=true;"
-                             "allow_os_buffer=false;"
                              "delayed_write_rate=4294976214;"
                              "manifest_preallocation_size=1222;"
                              "allow_mmap_writes=false;"
                              "stats_dump_period_sec=70127;"
                              "allow_fallocate=true;"
                              "allow_mmap_reads=false;"
+                             "use_direct_reads=false;"
+                             "use_direct_writes=false;"
                              "max_log_file_size=4607;"
                              "random_access_max_buffer_size=1048576;"
                              "advise_random_on_open=true;"
@@ -287,7 +287,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "info_log_level=DEBUG_LEVEL;"
                              "dump_malloc_stats=false;"
                              "allow_2pc=false;"
-                             "avoid_flush_during_recovery=false;",
+                             "avoid_flush_during_recovery=false;"
+                             "avoid_flush_during_shutdown=false;",
                              new_options));
 
   ASSERT_EQ(unset_bytes_base, NumUnsetBytes(new_options_ptr, sizeof(DBOptions),
@@ -310,30 +311,34 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
 // kColumnFamilyOptionsBlacklist, and maybe add customized verification
 // for it.
 TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
+  // options in the blacklist need to appear in the same order as in
+  // ColumnFamilyOptions.
   const OffsetGap kColumnFamilyOptionsBlacklist = {
-      {offsetof(struct ColumnFamilyOptions, comparator), sizeof(Comparator*)},
-      {offsetof(struct ColumnFamilyOptions, merge_operator),
-       sizeof(std::shared_ptr<MergeOperator>)},
-      {offsetof(struct ColumnFamilyOptions, compaction_filter),
-       sizeof(const CompactionFilter*)},
-      {offsetof(struct ColumnFamilyOptions, compaction_filter_factory),
-       sizeof(std::shared_ptr<CompactionFilterFactory>)},
-      {offsetof(struct ColumnFamilyOptions, compression_per_level),
-       sizeof(std::vector<CompressionType>)},
-      {offsetof(struct ColumnFamilyOptions, prefix_extractor),
-       sizeof(std::shared_ptr<const SliceTransform>)},
-      {offsetof(struct ColumnFamilyOptions,
-                max_bytes_for_level_multiplier_additional),
-       sizeof(std::vector<int>)},
-      {offsetof(struct ColumnFamilyOptions, memtable_factory),
-       sizeof(std::shared_ptr<MemTableRepFactory>)},
-      {offsetof(struct ColumnFamilyOptions, table_factory),
-       sizeof(std::shared_ptr<TableFactory>)},
-      {offsetof(struct ColumnFamilyOptions,
-                table_properties_collector_factories),
-       sizeof(ColumnFamilyOptions::TablePropertiesCollectorFactories)},
-      {offsetof(struct ColumnFamilyOptions, inplace_callback),
+      {offset_of(&ColumnFamilyOptions::inplace_callback),
        sizeof(UpdateStatus(*)(char*, uint32_t*, Slice, std::string*))},
+      {offset_of(
+           &ColumnFamilyOptions::memtable_insert_with_hint_prefix_extractor),
+       sizeof(std::shared_ptr<const SliceTransform>)},
+      {offset_of(&ColumnFamilyOptions::compression_per_level),
+       sizeof(std::vector<CompressionType>)},
+      {offset_of(
+           &ColumnFamilyOptions::max_bytes_for_level_multiplier_additional),
+       sizeof(std::vector<int>)},
+      {offset_of(&ColumnFamilyOptions::memtable_factory),
+       sizeof(std::shared_ptr<MemTableRepFactory>)},
+      {offset_of(&ColumnFamilyOptions::table_properties_collector_factories),
+       sizeof(ColumnFamilyOptions::TablePropertiesCollectorFactories)},
+      {offset_of(&ColumnFamilyOptions::comparator), sizeof(Comparator*)},
+      {offset_of(&ColumnFamilyOptions::merge_operator),
+       sizeof(std::shared_ptr<MergeOperator>)},
+      {offset_of(&ColumnFamilyOptions::compaction_filter),
+       sizeof(const CompactionFilter*)},
+      {offset_of(&ColumnFamilyOptions::compaction_filter_factory),
+       sizeof(std::shared_ptr<CompactionFilterFactory>)},
+      {offset_of(&ColumnFamilyOptions::prefix_extractor),
+       sizeof(std::shared_ptr<const SliceTransform>)},
+      {offset_of(&ColumnFamilyOptions::table_factory),
+       sizeof(std::shared_ptr<TableFactory>)},
   };
 
   char* options_ptr = new char[sizeof(ColumnFamilyOptions)];
@@ -365,7 +370,6 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
   // Following options are not settable through
   // GetColumnFamilyOptionsFromString():
   options->rate_limit_delay_max_milliseconds = 33;
-  options->compaction_pri = CompactionPri::kOldestSmallestSeqFirst;
   options->compaction_options_universal = CompactionOptionsUniversal();
   options->compression_opts = CompressionOptions();
   options->hard_rate_limit = 0;
@@ -405,7 +409,6 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "memtable_factory=SkipListFactory;"
       "compression=kNoCompression;"
       "bottommost_compression=kDisableCompressionOption;"
-      "min_partial_merge_operands=7576;"
       "level0_stop_writes_trigger=33;"
       "num_levels=99;"
       "level0_slowdown_writes_trigger=22;"
@@ -414,9 +417,9 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "soft_rate_limit=530.615385;"
       "soft_pending_compaction_bytes_limit=0;"
       "max_write_buffer_number_to_maintain=84;"
-      "verify_checksums_in_compaction=false;"
       "merge_operator=aabcxehazrMergeOperator;"
       "memtable_prefix_bloom_size_ratio=0.4642;"
+      "memtable_insert_with_hint_prefix_extractor=rocksdb.CappedPrefix.13;"
       "paranoid_file_checks=true;"
       "force_consistency_checks=true;"
       "inplace_update_num_locks=7429;"
@@ -424,6 +427,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "level_compaction_dynamic_level_bytes=false;"
       "inplace_update_support=false;"
       "compaction_style=kCompactionStyleFIFO;"
+      "compaction_pri=kMinOverlappingRatio;"
       "purge_redundant_kvs_while_flush=true;"
       "hard_pending_compaction_bytes_limit=0;"
       "disable_auto_compactions=false;"

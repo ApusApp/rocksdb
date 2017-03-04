@@ -69,11 +69,14 @@ class Status {
     kLockTimeout = 2,
     kLockLimit = 3,
     kNoSpace = 4,
+    kDeadlock = 5,
+    kStaleFile = 6,
     kMaxSubCode
   };
 
   SubCode subcode() const { return subcode_; }
 
+  // Returns a C style string indicating the message of the Status
   const char* getState() const { return state_; }
 
   // Return a success status.
@@ -194,9 +197,15 @@ class Status {
 
   bool IsAborted() const { return code() == kAborted; }
 
+  bool IsLockLimit() const {
+    return code() == kAborted && subcode() == kLockLimit;
+  }
+
   // Returns true iff the status indicates that a resource is Busy and
   // temporarily could not be acquired.
   bool IsBusy() const { return code() == kBusy; }
+
+  bool IsDeadlock() const { return code() == kBusy && subcode() == kDeadlock; }
 
   // Returns true iff the status indicated that the operation has Expired.
   bool IsExpired() const { return code() == kExpired; }

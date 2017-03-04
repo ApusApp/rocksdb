@@ -11,6 +11,7 @@
 #include <functional>
 
 #include "db/db_test_util.h"
+#include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/persistent_cache.h"
 #include "rocksdb/wal_filter.h"
@@ -956,6 +957,7 @@ TEST_F(DBTest2, PresetCompressionDict) {
   const int kNumL0Files = 5;
 
   Options options;
+  options.allow_concurrent_memtable_write = false;
   options.arena_block_size = kBlockSizeBytes;
   options.compaction_style = kCompactionStyleUniversal;
   options.create_if_missing = true;
@@ -1469,6 +1471,10 @@ class MockPersistentCache : public PersistentCache {
 
   virtual ~MockPersistentCache() {}
 
+  PersistentCache::StatsType Stats() override {
+    return PersistentCache::StatsType();
+  }
+
   Status Insert(const Slice& page_key, const char* data,
                 const size_t size) override {
     MutexLock _(&lock_);
@@ -1499,6 +1505,10 @@ class MockPersistentCache : public PersistentCache {
   }
 
   bool IsCompressed() override { return is_compressed_; }
+
+  std::string GetPrintableOptions() const override {
+    return "MockPersistentCache";
+  }
 
   port::Mutex lock_;
   std::map<std::string, std::string> data_;
@@ -1607,8 +1617,8 @@ TEST_F(DBTest2, SyncPointMarker) {
     CountSyncPoint();
   };
 
-  auto thread1 = std::thread(func1);
-  auto thread2 = std::thread(func2);
+  auto thread1 = port::Thread(func1);
+  auto thread2 = port::Thread(func2);
   thread1.join();
   thread2.join();
 
@@ -1897,8 +1907,8 @@ TEST_P(MergeOperatorPinningTest, TailingIterator) {
     delete iter;
   };
 
-  std::thread writer_thread(writer_func);
-  std::thread reader_thread(reader_func);
+  rocksdb::port::Thread writer_thread(writer_func);
+  rocksdb::port::Thread reader_thread(reader_func);
 
   writer_thread.join();
   reader_thread.join();
@@ -2085,8 +2095,26 @@ TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   cro.target_level = 2;
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
+  auto get_stat = [](std::string level_str, LevelStatType type,
+                     std::map<std::string, double> props) {
+    auto prop_str =
+        level_str + "." +
+        InternalStats::compaction_level_stats.at(type).property_name.c_str();
+    auto prop_item = props.find(prop_str);
+    return prop_item == props.end() ? 0 : prop_item->second;
+  };
+
   // Trivial move 2 files to L2
   ASSERT_EQ("0,0,2", FilesPerLevel());
+  // Also test that the stats GetMapProperty API reporting the same result
+  {
+    std::map<std::string, double> prop;
+    ASSERT_TRUE(dbfull()->GetMapProperty("rocksdb.cfstats", &prop));
+    ASSERT_EQ(0, get_stat("L0", LevelStatType::NUM_FILES, prop));
+    ASSERT_EQ(0, get_stat("L1", LevelStatType::NUM_FILES, prop));
+    ASSERT_EQ(2, get_stat("L2", LevelStatType::NUM_FILES, prop));
+    ASSERT_EQ(2, get_stat("Sum", LevelStatType::NUM_FILES, prop));
+  }
 
   // While the compaction is running, we will create 2 new files that
   // can fit in L2, these 2 files will be moved to L2 and overlap with
@@ -2113,6 +2141,13 @@ TEST_F(DBTest2, AutomaticCompactionOverlapManualCompaction) {
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+
+  // Test that the stats GetMapProperty API reporting 1 file in L2
+  {
+    std::map<std::string, double> prop;
+    ASSERT_TRUE(dbfull()->GetMapProperty("rocksdb.cfstats", &prop));
+    ASSERT_EQ(1, get_stat("L2", LevelStatType::NUM_FILES, prop));
+  }
 }
 
 TEST_F(DBTest2, ManualCompactionOverlapManualCompaction) {
@@ -2144,7 +2179,7 @@ TEST_F(DBTest2, ManualCompactionOverlapManualCompaction) {
     cro.exclusive_manual_compaction = false;
     ASSERT_OK(db_->CompactRange(cro, &k1s, &k2s));
   };
-  std::thread bg_thread;
+  rocksdb::port::Thread bg_thread;
 
   // While the compaction is running, we will create 2 new files that
   // can fit in L1, these 2 files will be moved to L1 and overlap with
@@ -2165,7 +2200,7 @@ TEST_F(DBTest2, ManualCompactionOverlapManualCompaction) {
         ASSERT_OK(Flush());
 
         // Start a non-exclusive manual compaction in a bg thread
-        bg_thread = std::thread(bg_manual_compact);
+        bg_thread = port::Thread(bg_manual_compact);
         // This manual compaction conflict with the other manual compaction
         // so it should wait until the first compaction finish
         env_->SleepForMicroseconds(1000000);
@@ -2182,8 +2217,87 @@ TEST_F(DBTest2, ManualCompactionOverlapManualCompaction) {
 
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
+
+TEST_F(DBTest2, OptimizeForPointLookup) {
+  Options options = CurrentOptions();
+  Close();
+  options.OptimizeForPointLookup(2);
+  ASSERT_OK(DB::Open(options, dbname_, &db_));
+
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_EQ("v1", Get("foo"));
+  Flush();
+  ASSERT_EQ("v1", Get("foo"));
+}
+
 #endif  // ROCKSDB_LITE
 
+TEST_F(DBTest2, GetRaceFlush1) {
+  ASSERT_OK(Put("foo", "v1"));
+
+  rocksdb::SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::GetImpl:1", "DBTest2::GetRaceFlush:1"},
+       {"DBTest2::GetRaceFlush:2", "DBImpl::GetImpl:2"}});
+
+  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+
+  rocksdb::port::Thread t1([&] {
+    TEST_SYNC_POINT("DBTest2::GetRaceFlush:1");
+    ASSERT_OK(Put("foo", "v2"));
+    Flush();
+    TEST_SYNC_POINT("DBTest2::GetRaceFlush:2");
+  });
+
+  // Get() is issued after the first Put(), so it should see either
+  // "v1" or "v2".
+  ASSERT_NE("NOT_FOUND", Get("foo"));
+  t1.join();
+  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTest2, GetRaceFlush2) {
+  ASSERT_OK(Put("foo", "v1"));
+
+  rocksdb::SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::GetImpl:3", "DBTest2::GetRaceFlush:1"},
+       {"DBTest2::GetRaceFlush:2", "DBImpl::GetImpl:4"}});
+
+  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+
+  port::Thread t1([&] {
+    TEST_SYNC_POINT("DBTest2::GetRaceFlush:1");
+    ASSERT_OK(Put("foo", "v2"));
+    Flush();
+    TEST_SYNC_POINT("DBTest2::GetRaceFlush:2");
+  });
+
+  // Get() is issued after the first Put(), so it should see either
+  // "v1" or "v2".
+  ASSERT_NE("NOT_FOUND", Get("foo"));
+  t1.join();
+  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTest2, DirectIO) {
+  if (!IsDirectIOSupported()) {
+    return;
+  }
+  Options options = CurrentOptions();
+  options.use_direct_reads = options.use_direct_writes = true;
+  options.allow_mmap_reads = options.allow_mmap_writes = false;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put(Key(0), "a"));
+  ASSERT_OK(Put(Key(5), "a"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put(Key(10), "a"));
+  ASSERT_OK(Put(Key(15), "a"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  Reopen(options);
+}
 }  // namespace rocksdb
 
 int main(int argc, char** argv) {

@@ -222,6 +222,7 @@ class PrefixTest : public testing::Test {
     bbto.filter_policy.reset(NewBloomFilterPolicy(10, false));
     bbto.whole_key_filtering = false;
     options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+    options.allow_concurrent_memtable_write = false;
 
     Status s = DB::Open(options, kDbName,  &db);
     EXPECT_OK(s);
@@ -292,6 +293,7 @@ TEST(SamePrefixTest, InDomainTest) {
   WriteOptions write_options;
   ReadOptions read_options;
   {
+    ASSERT_OK(DestroyDB(kDbName, Options()));
     ASSERT_OK(DB::Open(options, kDbName, &db));
     ASSERT_OK(db->Put(write_options, "HHKB pro2", "Mar 24, 2006"));
     ASSERT_OK(db->Put(write_options, "HHKB pro2 Type-S", "June 29, 2011"));

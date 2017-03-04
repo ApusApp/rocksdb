@@ -9,10 +9,12 @@
 #ifndef OS_WIN
 #include <unistd.h>
 #endif
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "util/crc32c.h"
+#include "port/port.h"
 
 namespace rocksdb {
 
@@ -201,12 +203,15 @@ bool RandomAccessCacheFile::OpenImpl(const bool enable_direct_reads) {
 
   Debug(log_, "Opening cache file %s", Path().c_str());
 
-  Status status = NewRandomAccessCacheFile(env_, Path(), &file_);
+  std::unique_ptr<RandomAccessFile> file;
+  Status status =
+      NewRandomAccessCacheFile(env_, Path(), &file, enable_direct_reads);
   if (!status.ok()) {
     Error(log_, "Error opening random access file %s. %s", Path().c_str(),
           status.ToString().c_str());
     return false;
   }
+  freader_.reset(new RandomAccessFileReader(std::move(file), env_));
 
   return true;
 }
@@ -216,10 +221,13 @@ bool RandomAccessCacheFile::Read(const LBA& lba, Slice* key, Slice* val,
   ReadLock _(&rwlock_);
 
   assert(lba.cache_id_ == cache_id_);
-  assert(file_);
+
+  if (!freader_) {
+    return false;
+  }
 
   Slice result;
-  Status s = file_->Read(lba.off_, lba.size_, &result, scratch);
+  Status s = freader_->Read(lba.off_, lba.size_, &result, scratch);
   if (!s.ok()) {
     Error(log_, "Error reading from file %s. %s", Path().c_str(),
           s.ToString().c_str());
@@ -259,11 +267,12 @@ WriteableCacheFile::~WriteableCacheFile() {
     // This file never flushed. We give priority to shutdown since this is a
     // cache
     // TODO(krad): Figure a way to flush the pending data
-    assert(file_);
-
-    assert(refs_ == 1);
-    --refs_;
+    if (file_) {
+      assert(refs_ == 1);
+      --refs_;
+    }
   }
+  assert(!refs_);
   ClearBuffers();
 }
 
@@ -514,7 +523,7 @@ ThreadedWriter::ThreadedWriter(PersistentCacheTier* const cache,
                                const size_t qdepth, const size_t io_size)
     : Writer(cache), io_size_(io_size) {
   for (size_t i = 0; i < qdepth; ++i) {
-    std::thread th(&ThreadedWriter::ThreadMain, this);
+    port::Thread th(&ThreadedWriter::ThreadMain, this);
     threads_.push_back(std::move(th));
   }
 }

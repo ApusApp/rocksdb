@@ -221,8 +221,6 @@ TEST_F(DBSSTTest, DeleteObsoleteFilesPendingOutputs) {
   listener->VerifyMatchedCount(1);
 }
 
-#endif  // ROCKSDB_LITE
-
 TEST_F(DBSSTTest, DBWithSstFileManager) {
   std::shared_ptr<SstFileManager> sst_file_manager(NewSstFileManager(env_));
   auto sfm = static_cast<SstFileManagerImpl*>(sst_file_manager.get());
@@ -287,7 +285,6 @@ TEST_F(DBSSTTest, DBWithSstFileManager) {
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
 
-#ifndef ROCKSDB_LITE
 TEST_F(DBSSTTest, RateLimitedDelete) {
   Destroy(last_options_);
   rocksdb::SyncPoint::GetInstance()->LoadDependency({
@@ -299,8 +296,31 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
   rocksdb::SyncPoint::GetInstance()->SetCallBack(
       "DeleteScheduler::BackgroundEmptyTrash:Wait",
       [&](void* arg) { penalties.push_back(*(static_cast<int*>(arg))); });
+  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+      "InstrumentedCondVar::TimedWaitInternal", [&](void* arg) {
+        // Turn timed wait into a simulated sleep
+        uint64_t* abs_time_us = static_cast<uint64_t*>(arg);
+        int64_t cur_time = 0;
+        env_->GetCurrentTime(&cur_time);
+        if (*abs_time_us > static_cast<uint64_t>(cur_time)) {
+          env_->addon_time_.fetch_add(*abs_time_us -
+                                      static_cast<uint64_t>(cur_time));
+        }
+
+        // Randomly sleep shortly
+        env_->addon_time_.fetch_add(
+            static_cast<uint64_t>(Random::GetTLSInstance()->Uniform(10)));
+
+        // Set wait until time to before current to force not to sleep.
+        int64_t real_cur_time = 0;
+        Env::Default()->GetCurrentTime(&real_cur_time);
+        *abs_time_us = static_cast<uint64_t>(real_cur_time);
+      });
+
   rocksdb::SyncPoint::GetInstance()->EnableProcessing();
 
+  env_->no_slowdown_ = true;
+  env_->time_elapse_only_sleep_ = true;
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
   options.env = env_;
@@ -348,6 +368,7 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
     ASSERT_EQ(expected_penlty, penalties[i]);
   }
   ASSERT_GT(time_spent_deleting, expected_penlty * 0.9);
+  ASSERT_LT(time_spent_deleting, expected_penlty * 1.1);
 
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 }
@@ -458,7 +479,6 @@ TEST_F(DBSSTTest, DestroyDBWithRateLimitedDelete) {
   // We have deleted the 4 sst files in the delete_scheduler
   ASSERT_EQ(bg_delete_file, 4);
 }
-#endif  // ROCKSDB_LITE
 
 TEST_F(DBSSTTest, DBWithMaxSpaceAllowed) {
   std::shared_ptr<SstFileManager> sst_file_manager(NewSstFileManager(env_));
@@ -556,7 +576,6 @@ TEST_F(DBSSTTest, DBWithMaxSpaceAllowedRandomized) {
   ASSERT_GT(reached_max_space_on_compaction, 0);
 }
 
-#ifndef ROCKSDB_LITE
 TEST_F(DBSSTTest, OpenDBWithInfiniteMaxOpenFiles) {
   // Open DB with infinite max open files
   //  - First iteration use 1 thread to open files
@@ -594,7 +613,7 @@ TEST_F(DBSSTTest, OpenDBWithInfiniteMaxOpenFiles) {
     }
     Close();
 
-    // Reopening the DB will load all exisitng files
+    // Reopening the DB will load all existing files
     Reopen(options);
     ASSERT_EQ("12,0,12", FilesPerLevel(0));
     std::vector<std::vector<FileMetaData>> files;

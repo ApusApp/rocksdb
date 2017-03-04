@@ -61,7 +61,8 @@ TableBuilder* NewTableBuilder(
 Status BuildTable(
     const std::string& dbname, Env* env, const ImmutableCFOptions& ioptions,
     const MutableCFOptions& mutable_cf_options, const EnvOptions& env_options,
-    TableCache* table_cache, InternalIterator* iter, FileMetaData* meta,
+    TableCache* table_cache, InternalIterator* iter,
+    std::unique_ptr<InternalIterator> range_del_iter, FileMetaData* meta,
     const InternalKeyComparator& internal_comparator,
     const std::vector<std::unique_ptr<IntTblPropCollectorFactory>>*
         int_tbl_prop_collector_factories,
@@ -81,6 +82,13 @@ Status BuildTable(
   Status s;
   meta->fd.file_size = 0;
   iter->SeekToFirst();
+  std::unique_ptr<RangeDelAggregator> range_del_agg(
+      new RangeDelAggregator(internal_comparator, snapshots));
+  s = range_del_agg->AddTombstones(std::move(range_del_iter));
+  if (!s.ok()) {
+    // may be non-ok if a range tombstone key is unparsable
+    return s;
+  }
 
   std::string fname = TableFileName(ioptions.db_paths, meta->fd.GetNumber(),
                                     meta->fd.GetPathId());
@@ -90,7 +98,7 @@ Status BuildTable(
 #endif  // !ROCKSDB_LITE
   TableProperties tp;
 
-  if (iter->Valid()) {
+  if (iter->Valid() || range_del_agg->ShouldAddTombstones()) {
     TableBuilder* builder;
     unique_ptr<WritableFileWriter> file_writer;
     {
@@ -104,7 +112,8 @@ Status BuildTable(
       }
       file->SetIOPriority(io_priority);
 
-      file_writer.reset(new WritableFileWriter(std::move(file), env_options));
+      file_writer.reset(new WritableFileWriter(std::move(file), env_options,
+                                               ioptions.statistics));
 
       builder = NewTableBuilder(
           ioptions, internal_comparator, int_tbl_prop_collector_factories,
@@ -114,14 +123,13 @@ Status BuildTable(
 
     MergeHelper merge(env, internal_comparator.user_comparator(),
                       ioptions.merge_operator, nullptr, ioptions.info_log,
-                      mutable_cf_options.min_partial_merge_operands,
                       true /* internal key corruption is not ok */,
                       snapshots.empty() ? 0 : snapshots.back());
 
-    CompactionIterator c_iter(iter, internal_comparator.user_comparator(),
-                              &merge, kMaxSequenceNumber, &snapshots,
-                              earliest_write_conflict_snapshot, env,
-                              true /* internal key corruption is not ok */);
+    CompactionIterator c_iter(
+        iter, internal_comparator.user_comparator(), &merge, kMaxSequenceNumber,
+        &snapshots, earliest_write_conflict_snapshot, env,
+        true /* internal key corruption is not ok */, range_del_agg.get());
     c_iter.SeekToFirst();
     for (; c_iter.Valid(); c_iter.Next()) {
       const Slice& key = c_iter.key();
@@ -136,6 +144,9 @@ Status BuildTable(
             ThreadStatus::FLUSH_BYTES_WRITTEN, IOSTATS(bytes_written));
       }
     }
+    // nullptr for table_{min,max} so all range tombstones will be flushed
+    range_del_agg->AddToBuilder(builder, nullptr /* lower_bound */,
+                                nullptr /* upper_bound */, meta);
 
     // Finish and check for builder errors
     bool empty = builder->NumEntries() == 0;
@@ -159,7 +170,7 @@ Status BuildTable(
     delete builder;
 
     // Finish and check for file errors
-    if (s.ok() && !empty && !ioptions.disable_data_sync) {
+    if (s.ok() && !empty) {
       StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
       file_writer->Sync(ioptions.use_fsync);
     }
@@ -170,7 +181,8 @@ Status BuildTable(
     if (s.ok() && !empty) {
       // Verify that the table is usable
       std::unique_ptr<InternalIterator> it(table_cache->NewIterator(
-          ReadOptions(), env_options, internal_comparator, meta->fd, nullptr,
+          ReadOptions(), env_options, internal_comparator, meta->fd,
+          nullptr /* range_del_agg */, nullptr,
           (internal_stats == nullptr) ? nullptr
                                       : internal_stats->GetFileReadHist(0),
           false /* for_compaction */, nullptr /* arena */,

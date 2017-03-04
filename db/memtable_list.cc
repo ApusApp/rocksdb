@@ -16,7 +16,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
-#include "table/merger.h"
+#include "table/merging_iterator.h"
 #include "util/coding.h"
 #include "util/log_buffer.h"
 #include "util/sync_point.h"
@@ -102,27 +102,36 @@ int MemTableList::NumFlushed() const {
 // Operands stores the list of merge operations to apply, so far.
 bool MemTableListVersion::Get(const LookupKey& key, std::string* value,
                               Status* s, MergeContext* merge_context,
-                              SequenceNumber* seq) {
-  return GetFromList(&memlist_, key, value, s, merge_context, seq);
+                              RangeDelAggregator* range_del_agg,
+                              SequenceNumber* seq,
+                              const ReadOptions& read_opts) {
+  return GetFromList(&memlist_, key, value, s, merge_context, range_del_agg,
+                     seq, read_opts);
 }
 
 bool MemTableListVersion::GetFromHistory(const LookupKey& key,
                                          std::string* value, Status* s,
                                          MergeContext* merge_context,
-                                         SequenceNumber* seq) {
-  return GetFromList(&memlist_history_, key, value, s, merge_context, seq);
+                                         RangeDelAggregator* range_del_agg,
+                                         SequenceNumber* seq,
+                                         const ReadOptions& read_opts) {
+  return GetFromList(&memlist_history_, key, value, s, merge_context,
+                     range_del_agg, seq, read_opts);
 }
 
 bool MemTableListVersion::GetFromList(std::list<MemTable*>* list,
                                       const LookupKey& key, std::string* value,
                                       Status* s, MergeContext* merge_context,
-                                      SequenceNumber* seq) {
+                                      RangeDelAggregator* range_del_agg,
+                                      SequenceNumber* seq,
+                                      const ReadOptions& read_opts) {
   *seq = kMaxSequenceNumber;
 
   for (auto& memtable : *list) {
     SequenceNumber current_seq = kMaxSequenceNumber;
 
-    bool done = memtable->Get(key, value, s, merge_context, &current_seq);
+    bool done = memtable->Get(key, value, s, merge_context, range_del_agg,
+                              &current_seq, read_opts);
     if (*seq == kMaxSequenceNumber) {
       // Store the most recent sequence number of any operation on this key.
       // Since we only care about the most recent change, we only need to
@@ -135,8 +144,26 @@ bool MemTableListVersion::GetFromList(std::list<MemTable*>* list,
       assert(*seq != kMaxSequenceNumber);
       return true;
     }
+    if (!done && !s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
+      return false;
+    }
   }
   return false;
+}
+
+Status MemTableListVersion::AddRangeTombstoneIterators(
+    const ReadOptions& read_opts, Arena* arena,
+    RangeDelAggregator* range_del_agg) {
+  assert(range_del_agg != nullptr);
+  for (auto& m : memlist_) {
+    std::unique_ptr<InternalIterator> range_del_iter(
+        m->NewRangeTombstoneIterator(read_opts));
+    Status s = range_del_agg->AddTombstones(std::move(range_del_iter));
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return Status::OK();
 }
 
 void MemTableListVersion::AddIterators(
@@ -163,13 +190,15 @@ uint64_t MemTableListVersion::GetTotalNumEntries() const {
   return total_num;
 }
 
-uint64_t MemTableListVersion::ApproximateSize(const Slice& start_ikey,
-                                              const Slice& end_ikey) {
-  uint64_t total_size = 0;
+MemTable::MemTableStats MemTableListVersion::ApproximateStats(
+    const Slice& start_ikey, const Slice& end_ikey) {
+  MemTable::MemTableStats total_stats = {0, 0};
   for (auto& m : memlist_) {
-    total_size += m->ApproximateSize(start_ikey, end_ikey);
+    auto mStats = m->ApproximateStats(start_ikey, end_ikey);
+    total_stats.size += mStats.size;
+    total_stats.count += mStats.count;
   }
-  return total_size;
+  return total_stats;
 }
 
 uint64_t MemTableListVersion::GetTotalNumDeletes() const {

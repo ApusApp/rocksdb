@@ -143,7 +143,7 @@ public class ColumnFamilyOptions extends RocksObject
   @Override
   public ColumnFamilyOptions setMergeOperator(
       final MergeOperator mergeOperator) {
-    setMergeOperator(nativeHandle_, mergeOperator.newMergeOperatorHandle());
+    setMergeOperator(nativeHandle_, mergeOperator.nativeHandle_);
     return this;
   }
 
@@ -352,14 +352,13 @@ public class ColumnFamilyOptions extends RocksObject
   }
 
   @Override
-  public ColumnFamilyOptions setMaxBytesForLevelMultiplier(
-      final int multiplier) {
+  public ColumnFamilyOptions setMaxBytesForLevelMultiplier(final double multiplier) {
     setMaxBytesForLevelMultiplier(nativeHandle_, multiplier);
     return this;
   }
 
   @Override
-  public int maxBytesForLevelMultiplier() {
+  public double maxBytesForLevelMultiplier() {
     return maxBytesForLevelMultiplier(nativeHandle_);
   }
 
@@ -475,19 +474,6 @@ public class ColumnFamilyOptions extends RocksObject
   }
 
   @Override
-  public ColumnFamilyOptions setVerifyChecksumsInCompaction(
-      final boolean verifyChecksumsInCompaction) {
-    setVerifyChecksumsInCompaction(
-        nativeHandle_, verifyChecksumsInCompaction);
-    return this;
-  }
-
-  @Override
-  public boolean verifyChecksumsInCompaction() {
-    return verifyChecksumsInCompaction(nativeHandle_);
-  }
-
-  @Override
   public ColumnFamilyOptions setMaxSequentialSkipInIterations(
       final long maxSequentialSkipInIterations) {
     setMaxSequentialSkipInIterations(nativeHandle_,
@@ -585,18 +571,6 @@ public class ColumnFamilyOptions extends RocksObject
   @Override
   public long maxSuccessiveMerges() {
     return maxSuccessiveMerges(nativeHandle_);
-  }
-
-  @Override
-  public ColumnFamilyOptions setMinPartialMergeOperands(
-      final int minPartialMergeOperands) {
-    setMinPartialMergeOperands(nativeHandle_, minPartialMergeOperands);
-    return this;
-  }
-
-  @Override
-  public int minPartialMergeOperands() {
-    return minPartialMergeOperands(nativeHandle_);
   }
 
   @Override
@@ -775,9 +749,8 @@ public class ColumnFamilyOptions extends RocksObject
       long handle, boolean enableLevelCompactionDynamicLevelBytes);
   private native boolean levelCompactionDynamicLevelBytes(
       long handle);
-  private native void setMaxBytesForLevelMultiplier(
-      long handle, int multiplier);
-  private native int maxBytesForLevelMultiplier(long handle);
+  private native void setMaxBytesForLevelMultiplier(long handle, double multiplier);
+  private native double maxBytesForLevelMultiplier(long handle);
   private native void setMaxCompactionBytes(long handle, long maxCompactionBytes);
   private native long maxCompactionBytes(long handle);
   private native void setSoftRateLimit(
@@ -804,9 +777,6 @@ public class ColumnFamilyOptions extends RocksObject
   private native void setPurgeRedundantKvsWhileFlush(
       long handle, boolean purgeRedundantKvsWhileFlush);
   private native boolean purgeRedundantKvsWhileFlush(long handle);
-  private native void setVerifyChecksumsInCompaction(
-      long handle, boolean verifyChecksumsInCompaction);
-  private native boolean verifyChecksumsInCompaction(long handle);
   private native void setMaxSequentialSkipInIterations(
       long handle, long maxSequentialSkipInIterations);
   private native long maxSequentialSkipInIterations(long handle);
@@ -831,9 +801,6 @@ public class ColumnFamilyOptions extends RocksObject
       long handle, long maxSuccessiveMerges)
       throws IllegalArgumentException;
   private native long maxSuccessiveMerges(long handle);
-  private native void setMinPartialMergeOperands(
-      long handle, int minPartialMergeOperands);
-  private native int minPartialMergeOperands(long handle);
   private native void setOptimizeFiltersForHits(long handle,
       boolean optimizeFiltersForHits);
   private native boolean optimizeFiltersForHits(long handle);

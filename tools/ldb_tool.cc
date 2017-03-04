@@ -29,15 +29,15 @@ void LDBCommandRunner::PrintHelp(const char* exec_name) {
              " : Values are input/output as hex\n");
   ret.append("  --" + LDBCommand::ARG_HEX +
              " : Both keys and values are input/output as hex\n");
-  ret.append(
-      "  --" + LDBCommand::ARG_CF_NAME +
-      " : name of the column family to operate on. default: default column "
-      "family\n");
   ret.append("\n");
 
   ret.append(
       "The following optional parameters control the database "
       "internals:\n");
+  ret.append(
+      "  --" + LDBCommand::ARG_CF_NAME +
+      "=<string> : name of the column family to operate on. default: default "
+      "column family\n");
   ret.append("  --" + LDBCommand::ARG_TTL +
              " with 'put','get','scan','dump','query','batchput'"
              " : DB supports ttl and value is internally timestamp-suffixed\n");
@@ -46,7 +46,7 @@ void LDBCommandRunner::PrintHelp(const char* exec_name) {
   ret.append("  --" + LDBCommand::ARG_COMPRESSION_TYPE +
              "=<no|snappy|zlib|bzip2|lz4|lz4hc|xpress|zstd>\n");
   ret.append("  --" + LDBCommand::ARG_COMPRESSION_MAX_DICT_BYTES +
-             "=<int,e.g.:14>\n");
+             "=<int,e.g.:16384>\n");
   ret.append("  --" + LDBCommand::ARG_BLOCK_SIZE + "=<block_size_in_bytes>\n");
   ret.append("  --" + LDBCommand::ARG_AUTO_COMPACTION + "=<true|false>\n");
   ret.append("  --" + LDBCommand::ARG_DB_WRITE_BUFFER_SIZE +
@@ -62,6 +62,7 @@ void LDBCommandRunner::PrintHelp(const char* exec_name) {
   BatchPutCommand::Help(ret);
   ScanCommand::Help(ret);
   DeleteCommand::Help(ret);
+  DeleteRangeCommand::Help(ret);
   DBQuerierCommand::Help(ret);
   ApproxSizeCommand::Help(ret);
   CheckConsistencyCommand::Help(ret);

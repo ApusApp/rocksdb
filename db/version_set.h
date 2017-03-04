@@ -34,6 +34,7 @@
 #include "db/dbformat.h"
 #include "db/file_indexer.h"
 #include "db/log_reader.h"
+#include "db/range_del_aggregator.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
@@ -162,21 +163,41 @@ class VersionStorageInfo {
       bool expand_range = true)   // if set, returns files which overlap the
       const;                      // range and overlap each other. If false,
                                   // then just files intersecting the range
+  void GetCleanInputsWithinInterval(
+      int level, const InternalKey* begin,  // nullptr means before all keys
+      const InternalKey* end,               // nullptr means after all keys
+      std::vector<FileMetaData*>* inputs,
+      int hint_index = -1,        // index of overlap file
+      int* file_index = nullptr)  // return index of overlap file
+      const;
 
-  void GetOverlappingInputsBinarySearch(
-      int level,
+  void GetOverlappingInputsRangeBinarySearch(
+      int level,           // level > 0
       const Slice& begin,  // nullptr means before all keys
       const Slice& end,    // nullptr means after all keys
       std::vector<FileMetaData*>* inputs,
-      int hint_index,          // index of overlap file
-      int* file_index) const;  // return index of overlap file
+      int hint_index,                // index of overlap file
+      int* file_index,               // return index of overlap file
+      bool within_interval = false)  // if set, force the inputs within interval
+      const;
 
-  void ExtendOverlappingInputs(
+  void ExtendFileRangeOverlappingInterval(
       int level,
       const Slice& begin,  // nullptr means before all keys
       const Slice& end,    // nullptr means after all keys
-      std::vector<FileMetaData*>* inputs,
-      unsigned int index) const;  // start extending from this index
+      unsigned int index,  // start extending from this index
+      int* startIndex,     // return the startIndex of input range
+      int* endIndex)       // return the endIndex of input range
+      const;
+
+  void ExtendFileRangeWithinInterval(
+      int level,
+      const Slice& begin,  // nullptr means before all keys
+      const Slice& end,    // nullptr means after all keys
+      unsigned int index,  // start extending from this index
+      int* startIndex,     // return the startIndex of input range
+      int* endIndex)       // return the endIndex of input range
+      const;
 
   // Returns true iff some file in the specified level overlaps
   // some part of [*smallest_user_key,*largest_user_key].
@@ -433,7 +454,12 @@ class Version {
   // yield the contents of this Version when merged together.
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   void AddIterators(const ReadOptions&, const EnvOptions& soptions,
-                    MergeIteratorBuilder* merger_iter_builder);
+                    MergeIteratorBuilder* merger_iter_builder,
+                    RangeDelAggregator* range_del_agg);
+
+  void AddIteratorsForLevel(const ReadOptions&, const EnvOptions& soptions,
+                            MergeIteratorBuilder* merger_iter_builder,
+                            int level, RangeDelAggregator* range_del_agg);
 
   // Lookup the value for key.  If found, store it in *val and
   // return OK.  Else return a non-OK status.
@@ -453,8 +479,8 @@ class Version {
   // REQUIRES: lock is not held
   void Get(const ReadOptions&, const LookupKey& key, std::string* val,
            Status* status, MergeContext* merge_context,
-           bool* value_found = nullptr, bool* key_exists = nullptr,
-           SequenceNumber* seq = nullptr);
+           RangeDelAggregator* range_del_agg, bool* value_found = nullptr,
+           bool* key_exists = nullptr, SequenceNumber* seq = nullptr);
 
   // Loads some stats information from files. Call without mutex held. It needs
   // to be called before applying the version to the version set.
@@ -513,6 +539,8 @@ class Version {
   Version* TEST_Next() const {
     return next_;
   }
+
+  int TEST_refs() const { return refs_; }
 
   VersionStorageInfo* storage_info() { return &storage_info_; }
 
@@ -695,7 +723,8 @@ class VersionSet {
 
   // Create an iterator that reads over the compaction inputs for "*c".
   // The caller should delete the iterator when no longer needed.
-  InternalIterator* MakeInputIterator(const Compaction* c);
+  InternalIterator* MakeInputIterator(const Compaction* c,
+                                      RangeDelAggregator* range_del_agg);
 
   // Add all files listed in any live version to *live.
   void AddLiveFiles(std::vector<FileDescriptor>* live_list);

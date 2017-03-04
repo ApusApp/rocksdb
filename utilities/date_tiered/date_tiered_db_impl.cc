@@ -15,7 +15,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/utilities/date_tiered_db.h"
-#include "table/merger.h"
+#include "table/merging_iterator.h"
 #include "util/coding.h"
 #include "util/instrumented_mutex.h"
 #include "util/options_helper.h"
@@ -385,7 +385,8 @@ Iterator* DateTieredDBImpl::NewIterator(const ReadOptions& opts) {
   MergeIteratorBuilder builder(cf_options_.comparator, arena);
   for (auto& item : handle_map_) {
     auto handle = item.second;
-    builder.AddIterator(db_impl->NewInternalIterator(arena, handle));
+    builder.AddIterator(db_impl->NewInternalIterator(
+        arena, db_iter->GetRangeDelAggregator(), handle));
   }
   auto internal_iter = builder.Finish();
   db_iter->SetIterUnderDBIter(internal_iter);

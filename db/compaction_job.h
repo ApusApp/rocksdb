@@ -25,6 +25,7 @@
 #include "db/job_context.h"
 #include "db/log_writer.h"
 #include "db/memtable_list.h"
+#include "db/range_del_aggregator.h"
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
@@ -56,7 +57,7 @@ class CompactionJob {
   CompactionJob(int job_id, Compaction* compaction,
                 const ImmutableDBOptions& db_options,
                 const EnvOptions& env_options, VersionSet* versions,
-                std::atomic<bool>* shutting_down, LogBuffer* log_buffer,
+                const std::atomic<bool>* shutting_down, LogBuffer* log_buffer,
                 Directory* db_directory, Directory* output_directory,
                 Statistics* stats, InstrumentedMutex* db_mutex,
                 Status* db_bg_error,
@@ -95,15 +96,18 @@ class CompactionJob {
   // kv-pairs
   void ProcessKeyValueCompaction(SubcompactionState* sub_compact);
 
-  Status FinishCompactionOutputFile(const Status& input_status,
-                                    SubcompactionState* sub_compact);
+  Status FinishCompactionOutputFile(
+      const Status& input_status, SubcompactionState* sub_compact,
+      RangeDelAggregator* range_del_agg,
+      CompactionIterationStats* range_del_out_stats,
+      const Slice* next_table_min_key = nullptr);
   Status InstallCompactionResults(const MutableCFOptions& mutable_cf_options);
   void RecordCompactionIOStats();
   Status OpenCompactionOutputFile(SubcompactionState* sub_compact);
   void CleanupCompaction();
   void UpdateCompactionJobStats(
     const InternalStats::CompactionStats& stats) const;
-  void RecordDroppedKeys(const CompactionIteratorStats& c_iter_stats,
+  void RecordDroppedKeys(const CompactionIterationStats& c_iter_stats,
                          CompactionJobStats* compaction_job_stats = nullptr);
 
   void UpdateCompactionStats();
@@ -127,7 +131,7 @@ class CompactionJob {
 
   Env* env_;
   VersionSet* versions_;
-  std::atomic<bool>* shutting_down_;
+  const std::atomic<bool>* shutting_down_;
   LogBuffer* log_buffer_;
   Directory* db_directory_;
   Directory* output_directory_;

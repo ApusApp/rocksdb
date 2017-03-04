@@ -16,20 +16,18 @@
 #include <numa.h>
 #include <numaif.h>
 #endif
-
 #ifndef OS_WIN
 #include <unistd.h>
 #endif
 #include <fcntl.h>
+#include <gflags/gflags.h>
 #include <inttypes.h>
-#include <cstddef>
-#include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <gflags/gflags.h>
-
+#include <sys/types.h>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -46,11 +44,11 @@
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
+#include "rocksdb/persistent_cache.h"
 #include "rocksdb/rate_limiter.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
-#include "rocksdb/utilities/env_registry.h"
-#include "rocksdb/utilities/flashcache.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/sim_cache.h"
@@ -63,117 +61,125 @@
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/statistics.h"
+#include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "util/testutil.h"
 #include "util/transaction_test_util.h"
 #include "util/xxhash.h"
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/merge_operators.h"
+#include "utilities/persistent_cache/block_cache_tier.h"
 
 #ifdef OS_WIN
 #include <io.h>  // open/close
 #endif
 
-namespace {
 using GFLAGS::ParseCommandLineFlags;
 using GFLAGS::RegisterFlagValidator;
 using GFLAGS::SetUsageMessage;
 
-DEFINE_string(benchmarks,
-              "fillseq,"
-              "fillsync,"
-              "fillrandom,"
-              "overwrite,"
-              "readrandom,"
-              "newiterator,"
-              "newiteratorwhilewriting,"
-              "seekrandom,"
-              "seekrandomwhilewriting,"
-              "seekrandomwhilemerging,"
-              "readseq,"
-              "readreverse,"
-              "compact,"
-              "readrandom,"
-              "multireadrandom,"
-              "readseq,"
-              "readtocache,"
-              "readreverse,"
-              "readwhilewriting,"
-              "readwhilemerging,"
-              "readrandomwriterandom,"
-              "updaterandom,"
-              "randomwithverify,"
-              "fill100K,"
-              "crc32c,"
-              "xxhash,"
-              "compress,"
-              "uncompress,"
-              "acquireload,"
-              "fillseekseq,"
-              "randomtransaction,"
-              "randomreplacekeys,"
-              "timeseries",
+DEFINE_string(
+    benchmarks,
+    "fillseq,"
+    "fillseqdeterministic,"
+    "fillsync,"
+    "fillrandom,"
+    "filluniquerandomdeterministic,"
+    "overwrite,"
+    "readrandom,"
+    "newiterator,"
+    "newiteratorwhilewriting,"
+    "seekrandom,"
+    "seekrandomwhilewriting,"
+    "seekrandomwhilemerging,"
+    "readseq,"
+    "readreverse,"
+    "compact,"
+    "readrandom,"
+    "multireadrandom,"
+    "readseq,"
+    "readtocache,"
+    "readreverse,"
+    "readwhilewriting,"
+    "readwhilemerging,"
+    "readrandomwriterandom,"
+    "updaterandom,"
+    "randomwithverify,"
+    "fill100K,"
+    "crc32c,"
+    "xxhash,"
+    "compress,"
+    "uncompress,"
+    "acquireload,"
+    "fillseekseq,"
+    "randomtransaction,"
+    "randomreplacekeys,"
+    "timeseries",
 
-              "Comma-separated list of operations to run in the specified"
-              " order. Available benchmarks:\n"
-              "\tfillseq       -- write N values in sequential key"
-              " order in async mode\n"
-              "\tfillrandom    -- write N values in random key order in async"
-              " mode\n"
-              "\toverwrite     -- overwrite N values in random key order in"
-              " async mode\n"
-              "\tfillsync      -- write N/100 values in random key order in "
-              "sync mode\n"
-              "\tfill100K      -- write N/1000 100K values in random order in"
-              " async mode\n"
-              "\tdeleteseq     -- delete N keys in sequential order\n"
-              "\tdeleterandom  -- delete N keys in random order\n"
-              "\treadseq       -- read N times sequentially\n"
-              "\treadtocache   -- 1 thread reading database sequentially\n"
-              "\treadreverse   -- read N times in reverse order\n"
-              "\treadrandom    -- read N times in random order\n"
-              "\treadmissing   -- read N missing keys in random order\n"
-              "\treadwhilewriting      -- 1 writer, N threads doing random "
-              "reads\n"
-              "\treadwhilemerging      -- 1 merger, N threads doing random "
-              "reads\n"
-              "\treadrandomwriterandom -- N threads doing random-read, "
-              "random-write\n"
-              "\tprefixscanrandom      -- prefix scan N times in random order\n"
-              "\tupdaterandom  -- N threads doing read-modify-write for random "
-              "keys\n"
-              "\tappendrandom  -- N threads doing read-modify-write with "
-              "growing values\n"
-              "\tmergerandom   -- same as updaterandom/appendrandom using merge"
-              " operator. "
-              "Must be used with merge_operator\n"
-              "\treadrandommergerandom -- perform N random read-or-merge "
-              "operations. Must be used with merge_operator\n"
-              "\tnewiterator   -- repeated iterator creation\n"
-              "\tseekrandom    -- N random seeks, call Next seek_nexts times "
-              "per seek\n"
-              "\tseekrandomwhilewriting -- seekrandom and 1 thread doing "
-              "overwrite\n"
-              "\tseekrandomwhilemerging -- seekrandom and 1 thread doing "
-              "merge\n"
-              "\tcrc32c        -- repeated crc32c of 4K of data\n"
-              "\txxhash        -- repeated xxHash of 4K of data\n"
-              "\tacquireload   -- load N*1000 times\n"
-              "\tfillseekseq   -- write N values in sequential key, then read "
-              "them by seeking to each key\n"
-              "\trandomtransaction     -- execute N random transactions and "
-              "verify correctness\n"
-              "\trandomreplacekeys     -- randomly replaces N keys by deleting "
-              "the old version and putting the new version\n\n"
-              "\ttimeseries            -- 1 writer generates time series data "
-              "and multiple readers doing random reads on id\n\n"
-              "Meta operations:\n"
-              "\tcompact     -- Compact the entire DB\n"
-              "\tstats       -- Print DB stats\n"
-              "\tlevelstats  -- Print the number of files and bytes per level\n"
-              "\tsstables    -- Print sstable info\n"
-              "\theapprofile -- Dump a heap profile (if supported by this"
-              " port)\n");
+    "Comma-separated list of operations to run in the specified"
+    " order. Available benchmarks:\n"
+    "\tfillseq       -- write N values in sequential key"
+    " order in async mode\n"
+    "\tfillseqdeterministic       -- write N values in the specified"
+    " key order and keep the shape of the LSM tree\n"
+    "\tfillrandom    -- write N values in random key order in async"
+    " mode\n"
+    "\tfilluniquerandomdeterministic       -- write N values in a random"
+    " key order and keep the shape of the LSM tree\n"
+    "\toverwrite     -- overwrite N values in random key order in"
+    " async mode\n"
+    "\tfillsync      -- write N/100 values in random key order in "
+    "sync mode\n"
+    "\tfill100K      -- write N/1000 100K values in random order in"
+    " async mode\n"
+    "\tdeleteseq     -- delete N keys in sequential order\n"
+    "\tdeleterandom  -- delete N keys in random order\n"
+    "\treadseq       -- read N times sequentially\n"
+    "\treadtocache   -- 1 thread reading database sequentially\n"
+    "\treadreverse   -- read N times in reverse order\n"
+    "\treadrandom    -- read N times in random order\n"
+    "\treadmissing   -- read N missing keys in random order\n"
+    "\treadwhilewriting      -- 1 writer, N threads doing random "
+    "reads\n"
+    "\treadwhilemerging      -- 1 merger, N threads doing random "
+    "reads\n"
+    "\treadrandomwriterandom -- N threads doing random-read, "
+    "random-write\n"
+    "\tprefixscanrandom      -- prefix scan N times in random order\n"
+    "\tupdaterandom  -- N threads doing read-modify-write for random "
+    "keys\n"
+    "\tappendrandom  -- N threads doing read-modify-write with "
+    "growing values\n"
+    "\tmergerandom   -- same as updaterandom/appendrandom using merge"
+    " operator. "
+    "Must be used with merge_operator\n"
+    "\treadrandommergerandom -- perform N random read-or-merge "
+    "operations. Must be used with merge_operator\n"
+    "\tnewiterator   -- repeated iterator creation\n"
+    "\tseekrandom    -- N random seeks, call Next seek_nexts times "
+    "per seek\n"
+    "\tseekrandomwhilewriting -- seekrandom and 1 thread doing "
+    "overwrite\n"
+    "\tseekrandomwhilemerging -- seekrandom and 1 thread doing "
+    "merge\n"
+    "\tcrc32c        -- repeated crc32c of 4K of data\n"
+    "\txxhash        -- repeated xxHash of 4K of data\n"
+    "\tacquireload   -- load N*1000 times\n"
+    "\tfillseekseq   -- write N values in sequential key, then read "
+    "them by seeking to each key\n"
+    "\trandomtransaction     -- execute N random transactions and "
+    "verify correctness\n"
+    "\trandomreplacekeys     -- randomly replaces N keys by deleting "
+    "the old version and putting the new version\n\n"
+    "\ttimeseries            -- 1 writer generates time series data "
+    "and multiple readers doing random reads on id\n\n"
+    "Meta operations:\n"
+    "\tcompact     -- Compact the entire DB\n"
+    "\tstats       -- Print DB stats\n"
+    "\tlevelstats  -- Print the number of files and bytes per level\n"
+    "\tsstables    -- Print sstable info\n"
+    "\theapprofile -- Dump a heap profile (if supported by this"
+    " port)\n");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
@@ -357,6 +363,11 @@ DEFINE_int32(cache_numshardbits, 6,
              " is 2 ** cache_numshardbits. Negative means use default settings."
              " This is applied only if FLAGS_cache_size is non-negative.");
 
+DEFINE_double(cache_high_pri_pool_ratio, 0.0,
+              "Ratio of block cache reserve for high pri blocks. "
+              "If > 0.0, we also enable "
+              "cache_index_and_filter_blocks_with_high_priority.");
+
 DEFINE_bool(use_clock_cache, false,
             "Replace default LRU block cache with clock cache.");
 
@@ -414,9 +425,6 @@ DEFINE_int32(random_access_max_buffer_size, 1024 * 1024,
 DEFINE_int32(writable_file_max_buffer_size, 1024 * 1024,
              "Maximum write buffer for Writable File");
 
-DEFINE_int32(skip_table_builder_flush, false, "Skip flushing block in "
-             "table builder ");
-
 DEFINE_int32(bloom_bits, -1, "Bloom filter bits per key. Negative means"
              " use default settings.");
 DEFINE_double(memtable_bloom_size_ratio, 0,
@@ -436,6 +444,20 @@ DEFINE_bool(show_table_properties, false,
 
 DEFINE_string(db, "", "Use the db with the following name.");
 
+// Read cache flags
+
+DEFINE_string(read_cache_path, "",
+              "If not empty string, a read cache will be used in this path");
+
+DEFINE_int64(read_cache_size, 4LL * 1024 * 1024 * 1024,
+             "Maximum size of the read cache");
+
+DEFINE_bool(read_cache_direct_write, true,
+            "Whether to use Direct IO for writing to the read cache");
+
+DEFINE_bool(read_cache_direct_read, true,
+            "Whether to use Direct IO for reading from read cache");
+
 static bool ValidateCacheNumshardbits(const char* flagname, int32_t value) {
   if (value >= 20) {
     fprintf(stderr, "Invalid value for --%s: %d, must be < 20\n",
@@ -449,15 +471,13 @@ DEFINE_bool(verify_checksum, false, "Verify checksum for every block read"
             " from storage");
 
 DEFINE_bool(statistics, false, "Database statistics");
+DEFINE_string(statistics_string, "", "Serialized statistics string");
 static class std::shared_ptr<rocksdb::Statistics> dbstats;
 
 DEFINE_int64(writes, -1, "Number of write operations to do. If negative, do"
              " --num reads.");
 
 DEFINE_bool(sync, false, "Sync all writes to disk");
-
-DEFINE_bool(disable_data_sync, false, "If true, do not wait until data is"
-            " synced to disk.");
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
@@ -467,18 +487,22 @@ DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
 
 DEFINE_int32(num_levels, 7, "The total number of levels");
 
-DEFINE_int64(target_file_size_base, 2 * 1048576, "Target file size at level-1");
+DEFINE_int64(target_file_size_base, rocksdb::Options().target_file_size_base,
+             "Target file size at level-1");
 
-DEFINE_int32(target_file_size_multiplier, 1,
+DEFINE_int32(target_file_size_multiplier,
+             rocksdb::Options().target_file_size_multiplier,
              "A multiplier to compute target level-N file size (N >= 2)");
 
-DEFINE_uint64(max_bytes_for_level_base,  10 * 1048576, "Max bytes for level-1");
+DEFINE_uint64(max_bytes_for_level_base,
+              rocksdb::Options().max_bytes_for_level_base,
+              "Max bytes for level-1");
 
 DEFINE_bool(level_compaction_dynamic_level_bytes, false,
             "Whether level size base is dynamic");
 
-DEFINE_int32(max_bytes_for_level_multiplier, 10,
-             "A multiplier to compute max bytes for level-N (N >= 2)");
+DEFINE_double(max_bytes_for_level_multiplier, 10,
+              "A multiplier to compute max bytes for level-N (N >= 2)");
 
 static std::vector<int> FLAGS_max_bytes_for_level_multiplier_additional_v;
 DEFINE_string(max_bytes_for_level_multiplier_additional, "",
@@ -531,6 +555,19 @@ DEFINE_bool(optimize_filters_for_hits, false,
 DEFINE_uint64(delete_obsolete_files_period_micros, 0,
               "Ignored. Left here for backward compatibility");
 
+DEFINE_int64(writes_per_range_tombstone, 0,
+             "Number of writes between range "
+             "tombstones");
+
+DEFINE_int64(range_tombstone_width, 100, "Number of keys in tombstone's range");
+
+DEFINE_int64(max_num_range_tombstones, 0,
+             "Maximum number of range tombstones "
+             "to insert.");
+
+DEFINE_bool(expand_range_tombstones, false,
+            "Expand range tombstone into sequential regular tombstones.");
+
 #ifndef ROCKSDB_LITE
 DEFINE_bool(optimistic_transaction_db, false,
             "Open a OptimisticTransactionDB instance. "
@@ -568,8 +605,6 @@ DEFINE_string(
     "\t--row_cache_size\n"
     "\t--row_cache_numshardbits\n"
     "\t--enable_io_prio\n"
-    "\t--disable_flashcache_for_background_threads\n"
-    "\t--flashcache_dev\n"
     "\t--dump_malloc_stats\n"
     "\t--num_multi_db\n");
 #endif  // ROCKSDB_LITE
@@ -577,9 +612,12 @@ DEFINE_string(
 DEFINE_bool(report_bg_io_stats, false,
             "Measure times spents on I/Os while in compactions. ");
 
+DEFINE_bool(use_stderr_info_logger, false,
+            "Write info logs to stderr instead of to LOG file. ");
+
 DEFINE_bool(use_blob_db, false, "Whether to use BlobDB. ");
 
-enum rocksdb::CompressionType StringToCompressionType(const char* ctype) {
+static enum rocksdb::CompressionType StringToCompressionType(const char* ctype) {
   assert(ctype);
 
   if (!strcasecmp(ctype, "none"))
@@ -603,7 +641,7 @@ enum rocksdb::CompressionType StringToCompressionType(const char* ctype) {
   return rocksdb::kSnappyCompression;  // default value
 }
 
-std::string ColumnFamilyName(size_t i) {
+static std::string ColumnFamilyName(size_t i) {
   if (i == 0) {
     return rocksdb::kDefaultColumnFamilyName;
   } else {
@@ -733,6 +771,11 @@ DEFINE_uint64(
     "If non-zero, db_bench will rate-limit the writes going into RocksDB. This "
     "is the global rate in bytes/second.");
 
+DEFINE_uint64(
+    benchmark_read_rate_limit, 0,
+    "If non-zero, db_bench will rate-limit the reads from RocksDB. This "
+    "is the global rate in ops/second.");
+
 DEFINE_uint64(max_compaction_bytes, rocksdb::Options().max_compaction_bytes,
               "Max bytes allowed in one compaction");
 
@@ -747,14 +790,17 @@ DEFINE_uint64(wal_size_limit_MB, 0, "Set the size limit for the WAL Files"
               " in MB.");
 DEFINE_uint64(max_total_wal_size, 0, "Set total max WAL size");
 
-DEFINE_bool(bufferedio, rocksdb::EnvOptions().use_os_buffer,
-            "Allow buffered io using OS buffers");
-
 DEFINE_bool(mmap_read, rocksdb::EnvOptions().use_mmap_reads,
             "Allow reads to occur via mmap-ing files");
 
 DEFINE_bool(mmap_write, rocksdb::EnvOptions().use_mmap_writes,
             "Allow writes to occur via mmap-ing files");
+
+DEFINE_bool(use_direct_reads, rocksdb::EnvOptions().use_direct_reads,
+            "Use O_DIRECT for reading data");
+
+DEFINE_bool(use_direct_writes, rocksdb::EnvOptions().use_direct_writes,
+            "Use O_DIRECT for writing data");
 
 DEFINE_bool(advise_random_on_open, rocksdb::Options().advise_random_on_open,
             "Advise random access on table file open");
@@ -763,11 +809,6 @@ DEFINE_string(compaction_fadvice, "NORMAL",
               "Access pattern advice when a file is compacted");
 static auto FLAGS_compaction_fadvice_e =
   rocksdb::Options().access_hint_on_compaction_start;
-
-DEFINE_bool(disable_flashcache_for_background_threads, false,
-            "Disable flashcache for background threads");
-
-DEFINE_string(flashcache_dev, "", "Path to flashcache device");
 
 DEFINE_bool(use_tailing_iterator, false,
             "Use tailing iterator to access a series of keys instead of get");
@@ -826,6 +867,9 @@ DEFINE_int32(prefix_size, 0, "control the prefix size for HashSkipList and "
 DEFINE_int64(keys_per_prefix, 0, "control average number of keys generated "
              "per prefix, 0 means no special handling of the prefix, "
              "i.e. use the prefix comes with the generated random number.");
+DEFINE_int32(memtable_insert_with_hint_prefix_size, 0,
+             "If non-zero, enable "
+             "memtable insert with hint with the given prefix size.");
 DEFINE_bool(enable_io_prio, false, "Lower the background flush/compaction "
             "threads' IO priority");
 DEFINE_bool(identity_as_first_hash, false, "the first hash function of cuckoo "
@@ -841,7 +885,7 @@ enum RepFactory {
   kCuckoo
 };
 
-enum RepFactory StringToRepFactory(const char* ctype) {
+static enum RepFactory StringToRepFactory(const char* ctype) {
   assert(ctype);
 
   if (!strcasecmp(ctype, "skip_list"))
@@ -909,7 +953,6 @@ static const bool FLAGS_deletepercent_dummy __attribute__((unused)) =
 static const bool FLAGS_table_cache_numshardbits_dummy __attribute__((unused)) =
     RegisterFlagValidator(&FLAGS_table_cache_numshardbits,
                           &ValidateTableCacheNumshardbits);
-}  // namespace
 
 namespace rocksdb {
 
@@ -1182,7 +1225,7 @@ class ReporterAgent {
       abort();
     }
 
-    reporting_thread_ = std::thread([&]() { SleepAndReport(); });
+    reporting_thread_ = port::Thread([&]() { SleepAndReport(); });
   }
 
   ~ReporterAgent() {
@@ -1242,7 +1285,7 @@ class ReporterAgent {
   std::atomic<int64_t> total_ops_done_;
   int64_t last_report_;
   const uint64_t report_interval_secs_;
-  std::thread reporting_thread_;
+  rocksdb::port::Thread reporting_thread_;
   std::mutex mutex_;
   // will notify on stop
   std::condition_variable stop_cv_;
@@ -1647,6 +1690,7 @@ struct SharedState {
   int total;
   int perf_level;
   std::shared_ptr<RateLimiter> write_rate_limiter;
+  std::shared_ptr<RateLimiter> read_rate_limiter;
 
   // Each thread goes through the following states:
   //    (1) initializing
@@ -1725,6 +1769,9 @@ class Benchmark {
   int prefix_size_;
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
+  int64_t writes_per_range_tombstone_;
+  int64_t range_tombstone_width_;
+  int64_t max_num_range_tombstones_;
   WriteOptions write_options_;
   Options open_options_;  // keep options around to properly destroy db later
   int64_t reads_;
@@ -1734,7 +1781,6 @@ class Benchmark {
   int64_t readwrites_;
   int64_t merge_keys_;
   bool report_file_operations_;
-  int cachedev_fd_;
 
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
@@ -1799,6 +1845,8 @@ class Benchmark {
              / 1048576.0));
     fprintf(stdout, "Write rate: %" PRIu64 " bytes/second\n",
             FLAGS_benchmark_write_rate_limit);
+    fprintf(stdout, "Read rate: %" PRIu64 " ops/second\n",
+            FLAGS_benchmark_read_rate_limit);
     if (FLAGS_enable_numa) {
       fprintf(stderr, "Running in NUMA enabled mode.\n");
 #ifndef NUMA
@@ -1963,7 +2011,9 @@ class Benchmark {
       }
       return cache;
     } else {
-      return NewLRUCache((size_t)capacity, FLAGS_cache_numshardbits);
+      return NewLRUCache((size_t)capacity, FLAGS_cache_numshardbits,
+                         false /*strict_capacity_limit*/,
+                         FLAGS_cache_high_pri_pool_ratio);
     }
   }
 
@@ -1990,8 +2040,7 @@ class Benchmark {
                 ? FLAGS_num
                 : ((FLAGS_writes > FLAGS_reads) ? FLAGS_writes : FLAGS_reads)),
         merge_keys_(FLAGS_merge_keys < 0 ? FLAGS_num : FLAGS_merge_keys),
-        report_file_operations_(FLAGS_report_file_operations),
-        cachedev_fd_(-1) {
+        report_file_operations_(FLAGS_report_file_operations) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -2030,6 +2079,16 @@ class Benchmark {
         options.wal_dir = FLAGS_wal_dir;
       }
       DestroyDB(FLAGS_db, options);
+      if (!FLAGS_wal_dir.empty()) {
+        FLAGS_env->DeleteDir(FLAGS_wal_dir);
+      }
+
+      if (FLAGS_num_multi_db > 1) {
+        FLAGS_env->CreateDir(FLAGS_db);
+        if (!FLAGS_wal_dir.empty()) {
+          FLAGS_env->CreateDir(FLAGS_wal_dir);
+        }
+      }
     }
   }
 
@@ -2039,11 +2098,6 @@ class Benchmark {
     if (cache_.get() != nullptr) {
       // this will leak, but we're shutting down so nobody cares
       cache_->DisownData();
-    }
-    if (FLAGS_disable_flashcache_for_background_threads && cachedev_fd_ != -1) {
-      // Dtor for this env should run before cachedev_fd_ is closed
-      flashcache_aware_env_ = nullptr;
-      close(cachedev_fd_);
     }
   }
 
@@ -2101,7 +2155,18 @@ class Benchmark {
     }
   }
 
-  std::string GetDbNameForMultiple(std::string base_name, size_t id) {
+  std::string GetPathForMultiple(std::string base_name, size_t id) {
+    if (!base_name.empty()) {
+#ifndef OS_WIN
+      if (base_name.back() != '/') {
+        base_name += '/';
+      }
+#else
+      if (base_name.back() != '\\') {
+        base_name += '\\';
+      }
+#endif
+    }
     return base_name + ToString(id);
   }
 
@@ -2123,6 +2188,9 @@ class Benchmark {
       value_size_ = FLAGS_value_size;
       key_size_ = FLAGS_key_size;
       entries_per_batch_ = FLAGS_batch_size;
+      writes_per_range_tombstone_ = FLAGS_writes_per_range_tombstone;
+      range_tombstone_width_ = FLAGS_range_tombstone_width;
+      max_num_range_tombstones_ = FLAGS_max_num_range_tombstones;
       write_options_ = WriteOptions();
       read_random_exp_range_ = FLAGS_read_random_exp_range;
       if (FLAGS_sync) {
@@ -2166,7 +2234,30 @@ class Benchmark {
         }
       }
 
-      if (name == "fillseq") {
+      // Both fillseqdeterministic and filluniquerandomdeterministic
+      // fill the levels except the max level with UNIQUE_RANDOM
+      // and fill the max level with fillseq and filluniquerandom, respectively
+      if (name == "fillseqdeterministic" ||
+          name == "filluniquerandomdeterministic") {
+        if (!FLAGS_disable_auto_compactions) {
+          fprintf(stderr,
+                  "Please disable_auto_compactions in FillDeterministic "
+                  "benchmark\n");
+          exit(1);
+        }
+        if (num_threads > 1) {
+          fprintf(stderr,
+                  "filldeterministic multithreaded not supported"
+                  ", use 1 thread\n");
+          num_threads = 1;
+        }
+        fresh_db = true;
+        if (name == "fillseqdeterministic") {
+          method = &Benchmark::WriteSeqDeterministic;
+        } else {
+          method = &Benchmark::WriteUniqueRandomDeterministic;
+        }
+      } else if (name == "fillseq") {
         fresh_db = true;
         method = &Benchmark::WriteSeq;
       } else if (name == "fillbatch") {
@@ -2316,9 +2407,13 @@ class Benchmark {
             db_.DeleteDBs();
             DestroyDB(FLAGS_db, open_options_);
           }
+          Options options = open_options_;
           for (size_t i = 0; i < multi_dbs_.size(); i++) {
             delete multi_dbs_[i].db;
-            DestroyDB(GetDbNameForMultiple(FLAGS_db, i), open_options_);
+            if (!open_options_.wal_dir.empty()) {
+              options.wal_dir = GetPathForMultiple(open_options_.wal_dir, i);
+            }
+            DestroyDB(GetPathForMultiple(FLAGS_db, i), options);
           }
           multi_dbs_.clear();
         }
@@ -2362,7 +2457,6 @@ class Benchmark {
   }
 
  private:
-  std::unique_ptr<Env> flashcache_aware_env_;
   std::shared_ptr<TimestampEmulator> timestamp_emulator_;
 
   struct ThreadArg {
@@ -2411,6 +2505,10 @@ class Benchmark {
     if (FLAGS_benchmark_write_rate_limit > 0) {
       shared.write_rate_limiter.reset(
           NewGenericRateLimiter(FLAGS_benchmark_write_rate_limit));
+    }
+    if (FLAGS_benchmark_read_rate_limit > 0) {
+      shared.read_rate_limiter.reset(
+          NewGenericRateLimiter(FLAGS_benchmark_read_rate_limit));
     }
 
     std::unique_ptr<ReporterAgent> reporter_agent;
@@ -2549,7 +2647,7 @@ class Benchmark {
     if (!ok) {
       thread->stats.AddMessage("(compression failure)");
     } else {
-      char buf[100];
+      char buf[340];
       snprintf(buf, sizeof(buf), "(output: %.1f%%)",
                (produced * 100.0) / bytes);
       thread->stats.AddMessage(buf);
@@ -2669,6 +2767,10 @@ class Benchmark {
     options.max_background_flushes = FLAGS_max_background_flushes;
     options.compaction_style = FLAGS_compaction_style_e;
     options.compaction_pri = FLAGS_compaction_pri_e;
+    options.allow_mmap_reads = FLAGS_mmap_read;
+    options.allow_mmap_writes = FLAGS_mmap_write;
+    options.use_direct_reads = FLAGS_use_direct_reads;
+    options.use_direct_writes = FLAGS_use_direct_writes;
     if (FLAGS_prefix_size != 0) {
       options.prefix_extractor.reset(
           NewFixedPrefixTransform(FLAGS_prefix_size));
@@ -2680,8 +2782,16 @@ class Benchmark {
         exit(1);
       }
     }
+    if (FLAGS_use_stderr_info_logger) {
+      options.info_log.reset(new StderrLogger());
+    }
     options.memtable_huge_page_size = FLAGS_memtable_use_huge_page ? 2048 : 0;
     options.memtable_prefix_bloom_size_ratio = FLAGS_memtable_bloom_size_ratio;
+    if (FLAGS_memtable_insert_with_hint_prefix_size > 0) {
+      options.memtable_insert_with_hint_prefix_extractor.reset(
+          NewCappedPrefixTransform(
+              FLAGS_memtable_insert_with_hint_prefix_size));
+    }
     options.bloom_locality = FLAGS_bloom_locality;
     options.max_file_opening_threads = FLAGS_file_opening_threads;
     options.new_table_reader_for_compaction_inputs =
@@ -2689,7 +2799,6 @@ class Benchmark {
     options.compaction_readahead_size = FLAGS_compaction_readahead_size;
     options.random_access_max_buffer_size = FLAGS_random_access_max_buffer_size;
     options.writable_file_max_buffer_size = FLAGS_writable_file_max_buffer_size;
-    options.disableDataSync = FLAGS_disable_data_sync;
     options.use_fsync = FLAGS_use_fsync;
     options.num_levels = FLAGS_num_levels;
     options.target_file_size_base = FLAGS_target_file_size_base;
@@ -2794,6 +2903,10 @@ class Benchmark {
           FLAGS_cache_index_and_filter_blocks;
       block_based_options.pin_l0_filter_and_index_blocks_in_cache =
           FLAGS_pin_l0_filter_and_index_blocks_in_cache;
+      if (FLAGS_cache_high_pri_pool_ratio > 1e-6) {  // > 0.0 + eps
+        block_based_options.cache_index_and_filter_blocks_with_high_priority =
+            true;
+      }
       block_based_options.block_cache = cache_;
       block_based_options.block_cache_compressed = compressed_cache_;
       block_based_options.block_size = FLAGS_block_size;
@@ -2801,10 +2914,47 @@ class Benchmark {
       block_based_options.index_block_restart_interval =
           FLAGS_index_block_restart_interval;
       block_based_options.filter_policy = filter_policy_;
-      block_based_options.skip_table_builder_flush =
-          FLAGS_skip_table_builder_flush;
       block_based_options.format_version = 2;
       block_based_options.read_amp_bytes_per_bit = FLAGS_read_amp_bytes_per_bit;
+      if (FLAGS_read_cache_path != "") {
+#ifndef ROCKSDB_LITE
+        Status rc_status;
+
+        // Read cache need to be provided with a the Logger, we will put all
+        // reac cache logs in the read cache path in a file named rc_LOG
+        rc_status = FLAGS_env->CreateDirIfMissing(FLAGS_read_cache_path);
+        std::shared_ptr<Logger> read_cache_logger;
+        if (rc_status.ok()) {
+          rc_status = FLAGS_env->NewLogger(FLAGS_read_cache_path + "/rc_LOG",
+                                           &read_cache_logger);
+        }
+
+        if (rc_status.ok()) {
+          PersistentCacheConfig rc_cfg(FLAGS_env, FLAGS_read_cache_path,
+                                       FLAGS_read_cache_size,
+                                       read_cache_logger);
+
+          rc_cfg.enable_direct_reads = FLAGS_read_cache_direct_read;
+          rc_cfg.enable_direct_writes = FLAGS_read_cache_direct_write;
+          rc_cfg.writer_qdepth = 4;
+          rc_cfg.writer_dispatch_size = 4 * 1024;
+
+          auto pcache = std::make_shared<BlockCacheTier>(rc_cfg);
+          block_based_options.persistent_cache = pcache;
+          rc_status = pcache->Open();
+        }
+
+        if (!rc_status.ok()) {
+          fprintf(stderr, "Error initializing read cache, %s\n",
+                  rc_status.ToString().c_str());
+          exit(1);
+        }
+#else
+        fprintf(stderr, "Read cache is not supported in LITE\n");
+        exit(1);
+
+#endif
+      }
       options.table_factory.reset(
           NewBlockBasedTableFactory(block_based_options));
     }
@@ -2862,9 +3012,6 @@ class Benchmark {
     options.optimize_filters_for_hits = FLAGS_optimize_filters_for_hits;
 
     // fill storage options
-    options.allow_os_buffer = FLAGS_bufferedio;
-    options.allow_mmap_reads = FLAGS_mmap_read;
-    options.allow_mmap_writes = FLAGS_mmap_write;
     options.advise_random_on_open = FLAGS_advise_random_on_open;
     options.access_hint_on_compaction_start = FLAGS_compaction_fadvice_e;
     options.use_adaptive_mutex = FLAGS_use_adaptive_mutex;
@@ -2928,6 +3075,7 @@ class Benchmark {
     options.statistics = dbstats;
     options.wal_dir = FLAGS_wal_dir;
     options.create_if_missing = !FLAGS_use_existing_db;
+    options.dump_malloc_stats = FLAGS_dump_malloc_stats;
 
     if (FLAGS_row_cache_size) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -2941,34 +3089,22 @@ class Benchmark {
       FLAGS_env->LowerThreadPoolIOPriority(Env::LOW);
       FLAGS_env->LowerThreadPoolIOPriority(Env::HIGH);
     }
-    if (FLAGS_disable_flashcache_for_background_threads && cachedev_fd_ == -1) {
-      // Avoid creating the env twice when an use_existing_db is true
-      cachedev_fd_ = open(FLAGS_flashcache_dev.c_str(), O_RDONLY);
-      if (cachedev_fd_ < 0) {
-        fprintf(stderr, "Open flash device failed\n");
-        exit(1);
-      }
-      flashcache_aware_env_ = NewFlashcacheAwareEnv(FLAGS_env, cachedev_fd_);
-      if (flashcache_aware_env_.get() == nullptr) {
-        fprintf(stderr, "Failed to open flashcache device at %s\n",
-                FLAGS_flashcache_dev.c_str());
-        std::abort();
-      }
-      options.env = flashcache_aware_env_.get();
-    } else {
-      options.env = FLAGS_env;
-    }
+    options.env = FLAGS_env;
 
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, FLAGS_db, &db_);
     } else {
       multi_dbs_.clear();
       multi_dbs_.resize(FLAGS_num_multi_db);
+      auto wal_dir = options.wal_dir;
       for (int i = 0; i < FLAGS_num_multi_db; i++) {
-        OpenDb(options, GetDbNameForMultiple(FLAGS_db, i), &multi_dbs_[i]);
+        if (!wal_dir.empty()) {
+          options.wal_dir = GetPathForMultiple(wal_dir, i);
+        }
+        OpenDb(options, GetPathForMultiple(FLAGS_db, i), &multi_dbs_[i]);
       }
+      options.wal_dir = wal_dir;
     }
-    options.dump_malloc_stats = FLAGS_dump_malloc_stats;
   }
 
   void Open(Options* opts) {
@@ -3054,6 +3190,15 @@ class Benchmark {
     RANDOM, SEQUENTIAL, UNIQUE_RANDOM
   };
 
+  void WriteSeqDeterministic(ThreadState* thread) {
+    DoDeterministicCompact(thread, open_options_.compaction_style, SEQUENTIAL);
+  }
+
+  void WriteUniqueRandomDeterministic(ThreadState* thread) {
+    DoDeterministicCompact(thread, open_options_.compaction_style,
+                           UNIQUE_RANDOM);
+  }
+
   void WriteSeq(ThreadState* thread) {
     DoWrite(thread, SEQUENTIAL);
   }
@@ -3096,6 +3241,7 @@ class Benchmark {
         case RANDOM:
           return rand_->Next() % num_;
         case UNIQUE_RANDOM:
+          assert(next_ + 1 < num_);
           return values_[next_++];
       }
       assert(false);
@@ -3162,7 +3308,21 @@ class Benchmark {
 
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
+    std::unique_ptr<const char[]> begin_key_guard;
+    Slice begin_key = AllocateKey(&begin_key_guard);
+    std::unique_ptr<const char[]> end_key_guard;
+    Slice end_key = AllocateKey(&end_key_guard);
+    std::vector<std::unique_ptr<const char[]>> expanded_key_guards;
+    std::vector<Slice> expanded_keys;
+    if (FLAGS_expand_range_tombstones) {
+      expanded_key_guards.resize(range_tombstone_width_);
+      for (auto& expanded_key_guard : expanded_key_guards) {
+        expanded_keys.emplace_back(AllocateKey(&expanded_key_guard));
+      }
+    }
+
     int64_t stage = 0;
+    int64_t num_written = 0;
     while (!duration.Done(entries_per_batch_)) {
       if (duration.GetStage() != stage) {
         stage = duration.GetStage();
@@ -3205,6 +3365,43 @@ class Benchmark {
                     gen.Generate(value_size_));
         }
         bytes += value_size_ + key_size_;
+        ++num_written;
+        if (writes_per_range_tombstone_ > 0 &&
+            num_written / writes_per_range_tombstone_ <
+                max_num_range_tombstones_ &&
+            num_written % writes_per_range_tombstone_ == 0) {
+          int64_t begin_num = key_gens[id]->Next();
+          if (FLAGS_expand_range_tombstones) {
+            for (int64_t offset = 0; offset < range_tombstone_width_;
+                 ++offset) {
+              GenerateKeyFromInt(begin_num + offset, FLAGS_num,
+                                 &expanded_keys[offset]);
+              if (FLAGS_use_blob_db) {
+                s = db_with_cfh->db->Delete(write_options_,
+                                            expanded_keys[offset]);
+              } else if (FLAGS_num_column_families <= 1) {
+                batch.Delete(expanded_keys[offset]);
+              } else {
+                batch.Delete(db_with_cfh->GetCfh(rand_num),
+                             expanded_keys[offset]);
+              }
+            }
+          } else {
+            GenerateKeyFromInt(begin_num, FLAGS_num, &begin_key);
+            GenerateKeyFromInt(begin_num + range_tombstone_width_, FLAGS_num,
+                               &end_key);
+            if (FLAGS_use_blob_db) {
+              s = db_with_cfh->db->DeleteRange(
+                  write_options_, db_with_cfh->db->DefaultColumnFamily(),
+                  begin_key, end_key);
+            } else if (FLAGS_num_column_families <= 1) {
+              batch.DeleteRange(begin_key, end_key);
+            } else {
+              batch.DeleteRange(db_with_cfh->GetCfh(rand_num), begin_key,
+                                end_key);
+            }
+          }
+        }
       }
       if (!FLAGS_use_blob_db) {
         s = db_with_cfh->db->Write(write_options_, &batch);
@@ -3217,6 +3414,268 @@ class Benchmark {
       }
     }
     thread->stats.AddBytes(bytes);
+  }
+
+  Status DoDeterministicCompact(ThreadState* thread,
+                                CompactionStyle compaction_style,
+                                WriteMode write_mode) {
+#ifndef ROCKSDB_LITE
+    ColumnFamilyMetaData meta;
+    std::vector<DB*> db_list;
+    if (db_.db != nullptr) {
+      db_list.push_back(db_.db);
+    } else {
+      for (auto& db : multi_dbs_) {
+        db_list.push_back(db.db);
+      }
+    }
+    std::vector<Options> options_list;
+    for (auto db : db_list) {
+      options_list.push_back(db->GetOptions());
+      db->SetOptions({{"disable_auto_compactions", "1"},
+                      {"level0_slowdown_writes_trigger", "400000000"},
+                      {"level0_stop_writes_trigger", "400000000"}});
+    }
+
+    assert(!db_list.empty());
+    auto num_db = db_list.size();
+    size_t num_levels = static_cast<size_t>(open_options_.num_levels);
+    size_t output_level = open_options_.num_levels - 1;
+    std::vector<std::vector<std::vector<SstFileMetaData>>> sorted_runs(num_db);
+    std::vector<size_t> num_files_at_level0(num_db, 0);
+
+    if (compaction_style == kCompactionStyleLevel) {
+      if (num_levels == 0) {
+        return Status::InvalidArgument("num_levels should be larger than 1");
+      }
+      bool should_stop = false;
+      while (!should_stop) {
+        if (sorted_runs[0].empty()) {
+          DoWrite(thread, write_mode);
+        } else {
+          DoWrite(thread, UNIQUE_RANDOM);
+        }
+        for (size_t i = 0; i < num_db; i++) {
+          auto db = db_list[i];
+          db->Flush(FlushOptions());
+          db->GetColumnFamilyMetaData(&meta);
+          if (num_files_at_level0[i] == meta.levels[0].files.size() ||
+              writes_ == 0) {
+            should_stop = true;
+            continue;
+          }
+          sorted_runs[i].emplace_back(
+              meta.levels[0].files.begin(),
+              meta.levels[0].files.end() - num_files_at_level0[i]);
+          num_files_at_level0[i] = meta.levels[0].files.size();
+          if (sorted_runs[i].back().size() == 1) {
+            should_stop = true;
+            continue;
+          }
+          if (sorted_runs[i].size() == output_level) {
+            auto& L1 = sorted_runs[i].back();
+            L1.erase(L1.begin(), L1.begin() + L1.size() / 3);
+            should_stop = true;
+            continue;
+          }
+        }
+        writes_ /= static_cast<int64_t>(open_options_.max_bytes_for_level_multiplier);
+      }
+      for (size_t i = 0; i < num_db; i++) {
+        if (sorted_runs[i].size() < num_levels - 1) {
+          fprintf(stderr, "n is too small to fill %" ROCKSDB_PRIszt " levels\n", num_levels);
+          exit(1);
+        }
+      }
+      for (size_t i = 0; i < num_db; i++) {
+        auto db = db_list[i];
+        auto compactionOptions = CompactionOptions();
+        auto options = db->GetOptions();
+        MutableCFOptions mutable_cf_options(options);
+        for (size_t j = 0; j < sorted_runs[i].size(); j++) {
+          compactionOptions.output_file_size_limit =
+              mutable_cf_options.MaxFileSizeForLevel(
+                  static_cast<int>(output_level));
+          std::cout << sorted_runs[i][j].size() << std::endl;
+          db->CompactFiles(compactionOptions, {sorted_runs[i][j].back().name,
+                                               sorted_runs[i][j].front().name},
+                           static_cast<int>(output_level - j) /*level*/);
+        }
+      }
+    } else if (compaction_style == kCompactionStyleUniversal) {
+      auto ratio = open_options_.compaction_options_universal.size_ratio;
+      bool should_stop = false;
+      while (!should_stop) {
+        if (sorted_runs[0].empty()) {
+          DoWrite(thread, write_mode);
+        } else {
+          DoWrite(thread, UNIQUE_RANDOM);
+        }
+        for (size_t i = 0; i < num_db; i++) {
+          auto db = db_list[i];
+          db->Flush(FlushOptions());
+          db->GetColumnFamilyMetaData(&meta);
+          if (num_files_at_level0[i] == meta.levels[0].files.size() ||
+              writes_ == 0) {
+            should_stop = true;
+            continue;
+          }
+          sorted_runs[i].emplace_back(
+              meta.levels[0].files.begin(),
+              meta.levels[0].files.end() - num_files_at_level0[i]);
+          num_files_at_level0[i] = meta.levels[0].files.size();
+          if (sorted_runs[i].back().size() == 1) {
+            should_stop = true;
+            continue;
+          }
+          num_files_at_level0[i] = meta.levels[0].files.size();
+        }
+        writes_ =  static_cast<int64_t>(writes_* static_cast<double>(100) / (ratio + 200));
+      }
+      for (size_t i = 0; i < num_db; i++) {
+        if (sorted_runs[i].size() < num_levels) {
+          fprintf(stderr, "n is too small to fill %" ROCKSDB_PRIszt  " levels\n", num_levels);
+          exit(1);
+        }
+      }
+      for (size_t i = 0; i < num_db; i++) {
+        auto db = db_list[i];
+        auto compactionOptions = CompactionOptions();
+        auto options = db->GetOptions();
+        MutableCFOptions mutable_cf_options(options);
+        for (size_t j = 0; j < sorted_runs[i].size(); j++) {
+          compactionOptions.output_file_size_limit =
+              mutable_cf_options.MaxFileSizeForLevel(
+                  static_cast<int>(output_level));
+          db->CompactFiles(
+              compactionOptions,
+              {sorted_runs[i][j].back().name, sorted_runs[i][j].front().name},
+              (output_level > j ? static_cast<int>(output_level - j)
+                                : 0) /*level*/);
+        }
+      }
+    } else if (compaction_style == kCompactionStyleFIFO) {
+      return Status::InvalidArgument("FIFO compaction is not supported");
+    } else {
+      fprintf(stdout,
+              "%-12s : skipped (-compaction_stype=kCompactionStyleNone)\n",
+              "filldeterministic");
+      return Status::InvalidArgument("None compaction is not supported");
+    }
+
+// Verify seqno and key range
+// Note: the seqno get changed at the max level by implementation
+// optimization, so skip the check of the max level.
+#ifndef NDEBUG
+    for (size_t k = 0; k < num_db; k++) {
+      auto db = db_list[k];
+      db->GetColumnFamilyMetaData(&meta);
+      // verify the number of sorted runs
+      if (compaction_style == kCompactionStyleLevel) {
+        assert(num_levels - 1 == sorted_runs[k].size());
+      } else if (compaction_style == kCompactionStyleUniversal) {
+        assert(meta.levels[0].files.size() + num_levels - 1 ==
+               sorted_runs[k].size());
+      } else if (compaction_style == kCompactionStyleFIFO) {
+        // TODO(gzh): FIFO compaction
+      }
+
+      // verify smallest/largest seqno and key range of each sorted run
+      auto max_level = num_levels - 1;
+      int level;
+      for (size_t i = 0; i < sorted_runs[k].size(); i++) {
+        level = static_cast<int>(max_level - i);
+        SequenceNumber sorted_run_smallest_seqno = kMaxSequenceNumber;
+        SequenceNumber sorted_run_largest_seqno = 0;
+        std::string sorted_run_smallest_key, sorted_run_largest_key;
+        bool first_key = true;
+        for (auto fileMeta : sorted_runs[k][i]) {
+          sorted_run_smallest_seqno =
+              std::min(sorted_run_smallest_seqno, fileMeta.smallest_seqno);
+          sorted_run_largest_seqno =
+              std::max(sorted_run_largest_seqno, fileMeta.largest_seqno);
+          if (first_key ||
+              db->DefaultColumnFamily()->GetComparator()->Compare(
+                  fileMeta.smallestkey, sorted_run_smallest_key) < 0) {
+            sorted_run_smallest_key = fileMeta.smallestkey;
+          }
+          if (first_key ||
+              db->DefaultColumnFamily()->GetComparator()->Compare(
+                  fileMeta.largestkey, sorted_run_largest_key) > 0) {
+            sorted_run_largest_key = fileMeta.largestkey;
+          }
+          first_key = false;
+        }
+        if (compaction_style == kCompactionStyleLevel ||
+            (compaction_style == kCompactionStyleUniversal && level > 0)) {
+          SequenceNumber level_smallest_seqno = kMaxSequenceNumber;
+          SequenceNumber level_largest_seqno = 0;
+          for (auto fileMeta : meta.levels[level].files) {
+            level_smallest_seqno =
+                std::min(level_smallest_seqno, fileMeta.smallest_seqno);
+            level_largest_seqno =
+                std::max(level_largest_seqno, fileMeta.largest_seqno);
+          }
+          assert(sorted_run_smallest_key ==
+                 meta.levels[level].files.front().smallestkey);
+          assert(sorted_run_largest_key ==
+                 meta.levels[level].files.back().largestkey);
+          if (level != static_cast<int>(max_level)) {
+            // compaction at max_level would change sequence number
+            assert(sorted_run_smallest_seqno == level_smallest_seqno);
+            assert(sorted_run_largest_seqno == level_largest_seqno);
+          }
+        } else if (compaction_style == kCompactionStyleUniversal) {
+          // level <= 0 means sorted runs on level 0
+          auto level0_file =
+              meta.levels[0].files[sorted_runs[k].size() - 1 - i];
+          assert(sorted_run_smallest_key == level0_file.smallestkey);
+          assert(sorted_run_largest_key == level0_file.largestkey);
+          if (level != static_cast<int>(max_level)) {
+            assert(sorted_run_smallest_seqno == level0_file.smallest_seqno);
+            assert(sorted_run_largest_seqno == level0_file.largest_seqno);
+          }
+        }
+      }
+    }
+#endif
+    // print the size of each sorted_run
+    for (size_t k = 0; k < num_db; k++) {
+      auto db = db_list[k];
+      fprintf(stdout,
+              "---------------------- DB %" ROCKSDB_PRIszt " LSM ---------------------\n", k);
+      db->GetColumnFamilyMetaData(&meta);
+      for (auto& levelMeta : meta.levels) {
+        if (levelMeta.files.empty()) {
+          continue;
+        }
+        if (levelMeta.level == 0) {
+          for (auto& fileMeta : levelMeta.files) {
+            fprintf(stdout, "Level[%d]: %s(size: %" PRIu64 " bytes)\n",
+                    levelMeta.level, fileMeta.name.c_str(), fileMeta.size);
+          }
+        } else {
+          fprintf(stdout, "Level[%d]: %s - %s(total size: %" PRIi64 " bytes)\n",
+                  levelMeta.level, levelMeta.files.front().name.c_str(),
+                  levelMeta.files.back().name.c_str(), levelMeta.size);
+        }
+      }
+    }
+    for (size_t i = 0; i < num_db; i++) {
+      db_list[i]->SetOptions(
+          {{"disable_auto_compactions",
+            std::to_string(options_list[i].disable_auto_compactions)},
+           {"level0_slowdown_writes_trigger",
+            std::to_string(options_list[i].level0_slowdown_writes_trigger)},
+           {"level0_stop_writes_trigger",
+            std::to_string(options_list[i].level0_stop_writes_trigger)}});
+    }
+    return Status::OK();
+#else
+    fprintf(stderr, "Rocksdb Lite doesn't support filldeterministic\n");
+    return Status::NotSupported(
+        "Rocksdb Lite doesn't support filldeterministic");
+#endif  // ROCKSDB_LITE
   }
 
   void ReadSequential(ThreadState* thread) {
@@ -3240,9 +3699,18 @@ class Benchmark {
       bytes += iter->key().size() + iter->value().size();
       thread->stats.FinishedOps(nullptr, db, 1, kRead);
       ++i;
+
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          i % 1024 == 1023) {
+        thread->shared->read_rate_limiter->Request(1024, Env::IO_HIGH);
+      }
     }
+
     delete iter;
     thread->stats.AddBytes(bytes);
+    if (FLAGS_perf_level > rocksdb::PerfLevel::kDisable) {
+      thread->stats.AddMessage(perf_context.ToString());
+    }
   }
 
   void ReadReverse(ThreadState* thread) {
@@ -3263,6 +3731,10 @@ class Benchmark {
       bytes += iter->key().size() + iter->value().size();
       thread->stats.FinishedOps(nullptr, db, 1, kRead);
       ++i;
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          i % 1024 == 1023) {
+        thread->shared->read_rate_limiter->Request(1024, Env::IO_HIGH);
+      }
     }
     delete iter;
     thread->stats.AddBytes(bytes);
@@ -3301,6 +3773,10 @@ class Benchmark {
           ++nonexist;
         }
       }
+      if (thread->shared->read_rate_limiter.get() != nullptr) {
+        thread->shared->read_rate_limiter->Request(100, Env::IO_HIGH);
+      }
+
       thread->stats.FinishedOps(nullptr, db, 100, kRead);
     } while (!duration.Done(100));
 
@@ -3369,6 +3845,12 @@ class Benchmark {
         fprintf(stderr, "Get returned an error: %s\n", s.ToString().c_str());
         abort();
       }
+
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          read % 256 == 255) {
+        thread->shared->read_rate_limiter->Request(256, Env::IO_HIGH);
+      }
+
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kRead);
     }
 
@@ -3388,6 +3870,7 @@ class Benchmark {
   // Returns the total number of keys found.
   void MultiReadRandom(ThreadState* thread) {
     int64_t read = 0;
+    int64_t num_multireads = 0;
     int64_t found = 0;
     ReadOptions options(FLAGS_verify_checksum, true);
     std::vector<Slice> keys;
@@ -3408,6 +3891,7 @@ class Benchmark {
       assert(static_cast<int64_t>(statuses.size()) == entries_per_batch_);
 
       read += entries_per_batch_;
+      num_multireads++;
       for (int64_t i = 0; i < entries_per_batch_; ++i) {
         if (statuses[i].ok()) {
           ++found;
@@ -3416,6 +3900,11 @@ class Benchmark {
                   statuses[i].ToString().c_str());
           abort();
         }
+      }
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          num_multireads % 256 == 255) {
+        thread->shared->read_rate_limiter->Request(256 * entries_per_batch_,
+                                                   Env::IO_HIGH);
       }
       thread->stats.FinishedOps(nullptr, db, entries_per_batch_, kRead);
     }
@@ -3508,6 +3997,11 @@ class Benchmark {
           iter_to_use->Prev();
         }
         assert(iter_to_use->status().ok());
+      }
+
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          read % 256 == 255) {
+        thread->shared->read_rate_limiter->Request(256, Env::IO_HIGH);
       }
 
       thread->stats.FinishedOps(&db_, db_.db, 1, kSeek);
@@ -4307,6 +4801,10 @@ class Benchmark {
         }
       }
       found += key_found;
+
+      if (thread->shared->read_rate_limiter.get() != nullptr) {
+        thread->shared->read_rate_limiter->Request(1, Env::IO_HIGH);
+      }
     }
     delete iter;
 
@@ -4429,6 +4927,24 @@ int db_bench_tool(int argc, char** argv) {
   ParseCommandLineFlags(&argc, &argv, true);
 
   FLAGS_compaction_style_e = (rocksdb::CompactionStyle) FLAGS_compaction_style;
+#ifndef ROCKSDB_LITE
+  if (FLAGS_statistics && !FLAGS_statistics_string.empty()) {
+    fprintf(stderr,
+            "Cannot provide both --statistics and --statistics_string.\n");
+    exit(1);
+  }
+  if (!FLAGS_statistics_string.empty()) {
+    std::unique_ptr<Statistics> custom_stats_guard;
+    dbstats.reset(NewCustomObject<Statistics>(FLAGS_statistics_string,
+                                              &custom_stats_guard));
+    custom_stats_guard.release();
+    if (dbstats == nullptr) {
+      fprintf(stderr, "No Statistics registered matching string: %s\n",
+              FLAGS_statistics_string.c_str());
+      exit(1);
+    }
+  }
+#endif  // ROCKSDB_LITE
   if (FLAGS_statistics) {
     dbstats = rocksdb::CreateDBStatistics();
   }
@@ -4454,7 +4970,7 @@ int db_bench_tool(int argc, char** argv) {
     fprintf(stderr, "Cannot provide both --hdfs and --env_uri.\n");
     exit(1);
   } else if (!FLAGS_env_uri.empty()) {
-    FLAGS_env = NewEnvFromUri(FLAGS_env_uri, &custom_env_guard);
+    FLAGS_env = NewCustomObject<Env>(FLAGS_env_uri, &custom_env_guard);
     if (FLAGS_env == nullptr) {
       fprintf(stderr, "No Env registered for URI: %s\n", FLAGS_env_uri.c_str());
       exit(1);

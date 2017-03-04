@@ -21,6 +21,7 @@
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
 #include "memtable/stl_wrappers.h"
+#include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -41,6 +42,7 @@
 #include "table/meta_blocks.h"
 #include "table/plain_table_factory.h"
 #include "table/scoped_arena_iterator.h"
+#include "table/sst_file_writer_collectors.h"
 #include "util/compression.h"
 #include "util/random.h"
 #include "util/statistics.h"
@@ -222,7 +224,7 @@ class BlockConstructor: public Constructor {
     BlockContents contents;
     contents.data = data_;
     contents.cachable = false;
-    block_ = new Block(std::move(contents));
+    block_ = new Block(std::move(contents), kDisableGlobalSequenceNumber);
     return Status::OK();
   }
   virtual InternalIterator* NewIterator() const override {
@@ -994,6 +996,7 @@ class TableTest : public testing::Test {
     }
     return *plain_internal_comparator;
   }
+  void IndexTest(BlockBasedTableOptions table_options);
 
  private:
   std::unique_ptr<InternalKeyComparator> plain_internal_comparator;
@@ -1176,21 +1179,29 @@ TEST_F(BlockBasedTableTest, RangeDelBlock) {
   c.Finish(options, ioptions, table_options, *internal_cmp, &sorted_keys,
            &kvmap);
 
-  std::unique_ptr<InternalIterator> iter(
-      c.GetTableReader()->NewRangeTombstoneIterator(ReadOptions()));
-  ASSERT_EQ(false, iter->Valid());
-  iter->SeekToFirst();
-  ASSERT_EQ(true, iter->Valid());
-  for (int i = 0; i < 2; i++) {
-    ASSERT_TRUE(iter->Valid());
-    RangeTombstone t(iter->key(), iter->value());
-    ASSERT_EQ(t.start_key_, keys[i]);
-    ASSERT_EQ(t.end_key_, vals[i]);
-    ASSERT_EQ(t.seq_, i);
-    iter->Next();
+  for (int j = 0; j < 2; ++j) {
+    std::unique_ptr<InternalIterator> iter(
+        c.GetTableReader()->NewRangeTombstoneIterator(ReadOptions()));
+    if (j > 0) {
+      // For second iteration, delete the table reader object and verify the
+      // iterator can still access its metablock's range tombstones.
+      c.ResetTableReader();
+    }
+    ASSERT_EQ(false, iter->Valid());
+    iter->SeekToFirst();
+    ASSERT_EQ(true, iter->Valid());
+    for (int i = 0; i < 2; i++) {
+      ASSERT_TRUE(iter->Valid());
+      ParsedInternalKey parsed_key;
+      ASSERT_TRUE(ParseInternalKey(iter->key(), &parsed_key));
+      RangeTombstone t(parsed_key, iter->value());
+      ASSERT_EQ(t.start_key_, keys[i]);
+      ASSERT_EQ(t.end_key_, vals[i]);
+      ASSERT_EQ(t.seq_, i);
+      iter->Next();
+    }
+    ASSERT_TRUE(!iter->Valid());
   }
-  ASSERT_TRUE(!iter->Valid());
-  c.ResetTableReader();
 }
 
 TEST_F(BlockBasedTableTest, FilterPolicyNameProperties) {
@@ -1373,12 +1384,17 @@ TEST_F(BlockBasedTableTest, TotalOrderSeekOnHashIndex) {
       options.prefix_extractor.reset(NewFixedPrefixTransform(4));
       break;
     case 3:
-    default:
       // Hash search index with filter policy
       table_options.index_type = BlockBasedTableOptions::kHashSearch;
       table_options.filter_policy.reset(NewBloomFilterPolicy(10));
       options.table_factory.reset(new BlockBasedTableFactory(table_options));
       options.prefix_extractor.reset(NewFixedPrefixTransform(4));
+      break;
+    case 4:
+    default:
+      // Binary search index
+      table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+      options.table_factory.reset(new BlockBasedTableFactory(table_options));
       break;
     }
 
@@ -1518,7 +1534,7 @@ void AddInternalKey(TableConstructor* c, const std::string& prefix,
   c->Add(k.Encode().ToString(), "v");
 }
 
-TEST_F(TableTest, HashIndexTest) {
+void TableTest::IndexTest(BlockBasedTableOptions table_options) {
   TableConstructor c(BytewiseComparator());
 
   // keys with prefix length 3, make sure the key/value is big enough to fill
@@ -1542,9 +1558,6 @@ TEST_F(TableTest, HashIndexTest) {
   stl_wrappers::KVMap kvmap;
   Options options;
   options.prefix_extractor.reset(NewFixedPrefixTransform(3));
-  BlockBasedTableOptions table_options;
-  table_options.index_type = BlockBasedTableOptions::kHashSearch;
-  table_options.hash_index_allow_collision = true;
   table_options.block_size = 1700;
   table_options.block_cache = NewLRUCache(1024, 4);
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -1558,7 +1571,7 @@ TEST_F(TableTest, HashIndexTest) {
   auto props = reader->GetTableProperties();
   ASSERT_EQ(5u, props->num_data_blocks);
 
-  std::unique_ptr<InternalIterator> hash_iter(
+  std::unique_ptr<InternalIterator> index_iter(
       reader->NewIterator(ReadOptions()));
 
   // -- Find keys do not exist, but have common prefix.
@@ -1568,13 +1581,13 @@ TEST_F(TableTest, HashIndexTest) {
 
   // find the lower bound of the prefix
   for (size_t i = 0; i < prefixes.size(); ++i) {
-    hash_iter->Seek(InternalKey(prefixes[i], 0, kTypeValue).Encode());
-    ASSERT_OK(hash_iter->status());
-    ASSERT_TRUE(hash_iter->Valid());
+    index_iter->Seek(InternalKey(prefixes[i], 0, kTypeValue).Encode());
+    ASSERT_OK(index_iter->status());
+    ASSERT_TRUE(index_iter->Valid());
 
     // seek the first element in the block
-    ASSERT_EQ(lower_bound[i], hash_iter->key().ToString());
-    ASSERT_EQ("v", hash_iter->value().ToString());
+    ASSERT_EQ(lower_bound[i], index_iter->key().ToString());
+    ASSERT_EQ("v", index_iter->value().ToString());
   }
 
   // find the upper bound of prefixes
@@ -1583,51 +1596,73 @@ TEST_F(TableTest, HashIndexTest) {
   // find existing keys
   for (const auto& item : kvmap) {
     auto ukey = ExtractUserKey(item.first).ToString();
-    hash_iter->Seek(ukey);
+    index_iter->Seek(ukey);
 
     // ASSERT_OK(regular_iter->status());
-    ASSERT_OK(hash_iter->status());
+    ASSERT_OK(index_iter->status());
 
     // ASSERT_TRUE(regular_iter->Valid());
-    ASSERT_TRUE(hash_iter->Valid());
+    ASSERT_TRUE(index_iter->Valid());
 
-    ASSERT_EQ(item.first, hash_iter->key().ToString());
-    ASSERT_EQ(item.second, hash_iter->value().ToString());
+    ASSERT_EQ(item.first, index_iter->key().ToString());
+    ASSERT_EQ(item.second, index_iter->value().ToString());
   }
 
   for (size_t i = 0; i < prefixes.size(); ++i) {
     // the key is greater than any existing keys.
     auto key = prefixes[i] + "9";
-    hash_iter->Seek(InternalKey(key, 0, kTypeValue).Encode());
+    index_iter->Seek(InternalKey(key, 0, kTypeValue).Encode());
 
-    ASSERT_OK(hash_iter->status());
+    ASSERT_OK(index_iter->status());
     if (i == prefixes.size() - 1) {
       // last key
-      ASSERT_TRUE(!hash_iter->Valid());
+      ASSERT_TRUE(!index_iter->Valid());
     } else {
-      ASSERT_TRUE(hash_iter->Valid());
+      ASSERT_TRUE(index_iter->Valid());
       // seek the first element in the block
-      ASSERT_EQ(upper_bound[i], hash_iter->key().ToString());
-      ASSERT_EQ("v", hash_iter->value().ToString());
+      ASSERT_EQ(upper_bound[i], index_iter->key().ToString());
+      ASSERT_EQ("v", index_iter->value().ToString());
     }
   }
 
   // find keys with prefix that don't match any of the existing prefixes.
   std::vector<std::string> non_exist_prefixes = {"002", "004", "006", "008"};
   for (const auto& prefix : non_exist_prefixes) {
-    hash_iter->Seek(InternalKey(prefix, 0, kTypeValue).Encode());
+    index_iter->Seek(InternalKey(prefix, 0, kTypeValue).Encode());
     // regular_iter->Seek(prefix);
 
-    ASSERT_OK(hash_iter->status());
+    ASSERT_OK(index_iter->status());
     // Seek to non-existing prefixes should yield either invalid, or a
     // key with prefix greater than the target.
-    if (hash_iter->Valid()) {
-      Slice ukey = ExtractUserKey(hash_iter->key());
+    if (index_iter->Valid()) {
+      Slice ukey = ExtractUserKey(index_iter->key());
       Slice ukey_prefix = options.prefix_extractor->Transform(ukey);
       ASSERT_TRUE(BytewiseComparator()->Compare(prefix, ukey_prefix) < 0);
     }
   }
   c.ResetTableReader();
+}
+
+TEST_F(TableTest, BinaryIndexTest) {
+  BlockBasedTableOptions table_options;
+  table_options.index_type = BlockBasedTableOptions::kBinarySearch;
+  IndexTest(table_options);
+}
+
+TEST_F(TableTest, HashIndexTest) {
+  BlockBasedTableOptions table_options;
+  table_options.index_type = BlockBasedTableOptions::kHashSearch;
+  IndexTest(table_options);
+}
+
+TEST_F(TableTest, PartitionIndexTest) {
+  const int max_index_keys = 5;
+  for (int i = 1; i <= max_index_keys + 1; i++) {
+    BlockBasedTableOptions table_options;
+    table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+    table_options.index_per_partition = i;
+    IndexTest(table_options);
+  }
 }
 
 // It's very hard to figure out the index block size of a block accurately.
@@ -1796,7 +1831,7 @@ TEST_F(BlockBasedTableTest, BlockCacheDisabledTest) {
   {
     GetContext get_context(options.comparator, nullptr, nullptr, nullptr,
                            GetContext::kNotFound, Slice(), nullptr, nullptr,
-                           nullptr, nullptr);
+                           nullptr, nullptr, nullptr);
     // a hack that just to trigger BlockBasedTable::GetFilter.
     reader->Get(ReadOptions(), "non-exist-key", &get_context);
     BlockCachePropertiesSnapshot props(options.statistics.get());
@@ -1962,7 +1997,7 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
   std::string value;
   GetContext get_context(options.comparator, nullptr, nullptr, nullptr,
                          GetContext::kNotFound, user_key, &value, nullptr,
-                         nullptr, nullptr);
+                         nullptr, nullptr, nullptr);
   ASSERT_OK(reader->Get(ReadOptions(), user_key, &get_context));
   ASSERT_EQ(value, "hello");
   BlockCachePropertiesSnapshot props(options.statistics.get());
@@ -2045,7 +2080,7 @@ TEST_F(BlockBasedTableTest, BlockReadCountTest) {
       std::string value;
       GetContext get_context(options.comparator, nullptr, nullptr, nullptr,
                              GetContext::kNotFound, user_key, &value, nullptr,
-                             nullptr, nullptr);
+                             nullptr, nullptr, nullptr);
       perf_context.Reset();
       ASSERT_OK(reader->Get(ReadOptions(), encoded_key, &get_context));
       if (index_and_filter_in_cache) {
@@ -2065,7 +2100,7 @@ TEST_F(BlockBasedTableTest, BlockReadCountTest) {
 
       get_context = GetContext(options.comparator, nullptr, nullptr, nullptr,
                                GetContext::kNotFound, user_key, &value, nullptr,
-                               nullptr, nullptr);
+                               nullptr, nullptr, nullptr);
       perf_context.Reset();
       ASSERT_OK(reader->Get(ReadOptions(), encoded_key, &get_context));
       ASSERT_EQ(get_context.State(), GetContext::kNotFound);
@@ -2195,8 +2230,8 @@ TEST_F(BlockBasedTableTest, NewIndexIteratorLeak) {
     std::unique_ptr<InternalIterator> iter(reader->NewIterator(ro));
   };
 
-  auto thread1 = std::thread(func1);
-  auto thread2 = std::thread(func2);
+  auto thread1 = port::Thread(func1);
+  auto thread2 = port::Thread(func2);
   thread1.join();
   thread2.join();
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
@@ -2440,11 +2475,19 @@ TEST_F(MemTableTest, Simple) {
 
   for (int i = 0; i < 2; ++i) {
     Arena arena;
-    ScopedArenaIterator iter =
-        i == 0
-            ? ScopedArenaIterator(memtable->NewIterator(ReadOptions(), &arena))
-            : ScopedArenaIterator(
-                  memtable->NewRangeTombstoneIterator(ReadOptions(), &arena));
+    ScopedArenaIterator arena_iter_guard;
+    std::unique_ptr<InternalIterator> iter_guard;
+    InternalIterator* iter;
+    if (i == 0) {
+      iter = memtable->NewIterator(ReadOptions(), &arena);
+      arena_iter_guard.set(iter);
+    } else {
+      iter = memtable->NewRangeTombstoneIterator(ReadOptions());
+      iter_guard.reset(iter);
+    }
+    if (iter == nullptr) {
+      continue;
+    }
     iter->SeekToFirst();
     while (iter->Valid()) {
       fprintf(stderr, "key: '%s' -> '%s'\n", iter->key().ToString().c_str(),
@@ -2743,6 +2786,183 @@ TEST_F(PrefixTest, PrefixAndWholeKeyTest) {
   delete db;
   // In the second round, turn whole_key_filtering off and expect
   // rocksdb still works.
+}
+
+TEST_F(BlockBasedTableTest, TableWithGlobalSeqno) {
+  BlockBasedTableOptions bbto;
+  test::StringSink* sink = new test::StringSink();
+  unique_ptr<WritableFileWriter> file_writer(test::GetWritableFileWriter(sink));
+  Options options;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  const ImmutableCFOptions ioptions(options);
+  InternalKeyComparator ikc(options.comparator);
+  std::vector<std::unique_ptr<IntTblPropCollectorFactory>>
+      int_tbl_prop_collector_factories;
+  int_tbl_prop_collector_factories.emplace_back(
+      new SstFileWriterPropertiesCollectorFactory(2 /* version */,
+                                                  0 /* global_seqno*/));
+  std::string column_family_name;
+  std::unique_ptr<TableBuilder> builder(options.table_factory->NewTableBuilder(
+      TableBuilderOptions(ioptions, ikc, &int_tbl_prop_collector_factories,
+                          kNoCompression, CompressionOptions(),
+                          nullptr /* compression_dict */,
+                          false /* skip_filters */, column_family_name, -1),
+      TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
+      file_writer.get()));
+
+  for (char c = 'a'; c <= 'z'; ++c) {
+    std::string key(8, c);
+    std::string value = key;
+    InternalKey ik(key, 0, kTypeValue);
+
+    builder->Add(ik.Encode(), value);
+  }
+  ASSERT_OK(builder->Finish());
+  file_writer->Flush();
+
+  test::RandomRWStringSink ss_rw(sink);
+  uint32_t version;
+  uint64_t global_seqno;
+  uint64_t global_seqno_offset;
+
+  // Helper function to get version, global_seqno, global_seqno_offset
+  std::function<void()> GetVersionAndGlobalSeqno = [&]() {
+    unique_ptr<RandomAccessFileReader> file_reader(
+        test::GetRandomAccessFileReader(
+            new test::StringSource(ss_rw.contents(), 73342, true)));
+
+    TableProperties* props = nullptr;
+    ASSERT_OK(ReadTableProperties(file_reader.get(), ss_rw.contents().size(),
+                                  kBlockBasedTableMagicNumber, ioptions,
+                                  &props));
+
+    UserCollectedProperties user_props = props->user_collected_properties;
+    version = DecodeFixed32(
+        user_props[ExternalSstFilePropertyNames::kVersion].c_str());
+    global_seqno = DecodeFixed64(
+        user_props[ExternalSstFilePropertyNames::kGlobalSeqno].c_str());
+    global_seqno_offset =
+        props->properties_offsets[ExternalSstFilePropertyNames::kGlobalSeqno];
+
+    delete props;
+  };
+
+  // Helper function to update the value of the global seqno in the file
+  std::function<void(uint64_t)> SetGlobalSeqno = [&](uint64_t val) {
+    std::string new_global_seqno;
+    PutFixed64(&new_global_seqno, val);
+
+    ASSERT_OK(ss_rw.Write(global_seqno_offset, new_global_seqno));
+  };
+
+  // Helper function to get the contents of the table InternalIterator
+  unique_ptr<TableReader> table_reader;
+  std::function<InternalIterator*()> GetTableInternalIter = [&]() {
+    unique_ptr<RandomAccessFileReader> file_reader(
+        test::GetRandomAccessFileReader(
+            new test::StringSource(ss_rw.contents(), 73342, true)));
+
+    options.table_factory->NewTableReader(
+        TableReaderOptions(ioptions, EnvOptions(), ikc), std::move(file_reader),
+        ss_rw.contents().size(), &table_reader);
+
+    return table_reader->NewIterator(ReadOptions());
+  };
+
+  GetVersionAndGlobalSeqno();
+  ASSERT_EQ(2, version);
+  ASSERT_EQ(0, global_seqno);
+
+  InternalIterator* iter = GetTableInternalIter();
+  char current_c = 'a';
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey pik;
+    ASSERT_TRUE(ParseInternalKey(iter->key(), &pik));
+
+    ASSERT_EQ(pik.type, ValueType::kTypeValue);
+    ASSERT_EQ(pik.sequence, 0);
+    ASSERT_EQ(pik.user_key, iter->value());
+    ASSERT_EQ(pik.user_key.ToString(), std::string(8, current_c));
+    current_c++;
+  }
+  ASSERT_EQ(current_c, 'z' + 1);
+  delete iter;
+
+  // Update global sequence number to 10
+  SetGlobalSeqno(10);
+  GetVersionAndGlobalSeqno();
+  ASSERT_EQ(2, version);
+  ASSERT_EQ(10, global_seqno);
+
+  iter = GetTableInternalIter();
+  current_c = 'a';
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey pik;
+    ASSERT_TRUE(ParseInternalKey(iter->key(), &pik));
+
+    ASSERT_EQ(pik.type, ValueType::kTypeValue);
+    ASSERT_EQ(pik.sequence, 10);
+    ASSERT_EQ(pik.user_key, iter->value());
+    ASSERT_EQ(pik.user_key.ToString(), std::string(8, current_c));
+    current_c++;
+  }
+  ASSERT_EQ(current_c, 'z' + 1);
+
+  // Verify Seek
+  for (char c = 'a'; c <= 'z'; c++) {
+    std::string k = std::string(8, c);
+    InternalKey ik(k, 10, kValueTypeForSeek);
+    iter->Seek(ik.Encode());
+    ASSERT_TRUE(iter->Valid());
+
+    ParsedInternalKey pik;
+    ASSERT_TRUE(ParseInternalKey(iter->key(), &pik));
+
+    ASSERT_EQ(pik.type, ValueType::kTypeValue);
+    ASSERT_EQ(pik.sequence, 10);
+    ASSERT_EQ(pik.user_key.ToString(), k);
+    ASSERT_EQ(iter->value().ToString(), k);
+  }
+  delete iter;
+
+  // Update global sequence number to 3
+  SetGlobalSeqno(3);
+  GetVersionAndGlobalSeqno();
+  ASSERT_EQ(2, version);
+  ASSERT_EQ(3, global_seqno);
+
+  iter = GetTableInternalIter();
+  current_c = 'a';
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey pik;
+    ASSERT_TRUE(ParseInternalKey(iter->key(), &pik));
+
+    ASSERT_EQ(pik.type, ValueType::kTypeValue);
+    ASSERT_EQ(pik.sequence, 3);
+    ASSERT_EQ(pik.user_key, iter->value());
+    ASSERT_EQ(pik.user_key.ToString(), std::string(8, current_c));
+    current_c++;
+  }
+  ASSERT_EQ(current_c, 'z' + 1);
+
+  // Verify Seek
+  for (char c = 'a'; c <= 'z'; c++) {
+    std::string k = std::string(8, c);
+    // seqno=4 is less than 3 so we still should get our key
+    InternalKey ik(k, 4, kValueTypeForSeek);
+    iter->Seek(ik.Encode());
+    ASSERT_TRUE(iter->Valid());
+
+    ParsedInternalKey pik;
+    ASSERT_TRUE(ParseInternalKey(iter->key(), &pik));
+
+    ASSERT_EQ(pik.type, ValueType::kTypeValue);
+    ASSERT_EQ(pik.sequence, 3);
+    ASSERT_EQ(pik.user_key.ToString(), k);
+    ASSERT_EQ(iter->value().ToString(), k);
+  }
+
+  delete iter;
 }
 
 }  // namespace rocksdb

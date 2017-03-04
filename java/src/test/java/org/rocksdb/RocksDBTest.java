@@ -12,6 +12,7 @@ import org.junit.rules.TemporaryFolder;
 import java.util.*;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.fail;
 
 public class RocksDBTest {
 
@@ -43,6 +44,21 @@ public class RocksDBTest {
   }
 
   @Test
+  public void openWhenOpen() throws RocksDBException {
+    final String dbPath = dbFolder.getRoot().getAbsolutePath();
+
+    try (final RocksDB db1 = RocksDB.open(dbPath)) {
+      try (final RocksDB db2 = RocksDB.open(dbPath)) {
+        fail("Should have thrown an exception when opening the same db twice");
+      } catch (final RocksDBException e) {
+        assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.IOError);
+        assertThat(e.getStatus().getSubCode()).isEqualTo(Status.SubCode.None);
+        assertThat(e.getStatus().getState()).startsWith("lock ");
+      }
+    }
+  }
+
+  @Test
   public void put() throws RocksDBException {
     try (final RocksDB db = RocksDB.open(dbFolder.getRoot().getAbsolutePath());
          final WriteOptions opt = new WriteOptions()) {
@@ -57,8 +73,10 @@ public class RocksDBTest {
 
   @Test
   public void write() throws RocksDBException {
-    try (final Options options = new Options().setMergeOperator(
-        new StringAppendOperator()).setCreateIfMissing(true);
+    try (final StringAppendOperator stringAppendOperator = new StringAppendOperator();
+         final Options options = new Options()
+             .setMergeOperator(stringAppendOperator)
+             .setCreateIfMissing(true);
          final RocksDB db = RocksDB.open(options,
              dbFolder.getRoot().getAbsolutePath());
          final WriteOptions opts = new WriteOptions()) {
@@ -166,9 +184,10 @@ public class RocksDBTest {
 
   @Test
   public void merge() throws RocksDBException {
-    try (final Options opt = new Options()
-        .setCreateIfMissing(true)
-        .setMergeOperator(new StringAppendOperator());
+    try (final StringAppendOperator stringAppendOperator = new StringAppendOperator();
+         final Options opt = new Options()
+            .setCreateIfMissing(true)
+            .setMergeOperator(stringAppendOperator);
          final WriteOptions wOpt = new WriteOptions();
          final RocksDB db = RocksDB.open(opt,
              dbFolder.getRoot().getAbsolutePath())

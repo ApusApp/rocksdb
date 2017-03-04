@@ -188,7 +188,7 @@ public class Options extends RocksObject
 
   @Override
   public Options setMergeOperator(final MergeOperator mergeOperator) {
-    setMergeOperator(nativeHandle_, mergeOperator.newMergeOperatorHandle());
+    setMergeOperator(nativeHandle_, mergeOperator.nativeHandle_);
     return this;
   }
 
@@ -267,19 +267,6 @@ public class Options extends RocksObject
   public Options setMaxOpenFiles(final int maxOpenFiles) {
     assert(isOwningHandle());
     setMaxOpenFiles(nativeHandle_, maxOpenFiles);
-    return this;
-  }
-
-  @Override
-  public boolean disableDataSync() {
-    assert(isOwningHandle());
-    return disableDataSync(nativeHandle_);
-  }
-
-  @Override
-  public Options setDisableDataSync(final boolean disableDataSync) {
-    assert(isOwningHandle());
-    setDisableDataSync(nativeHandle_, disableDataSync);
     return this;
   }
 
@@ -530,17 +517,31 @@ public class Options extends RocksObject
   }
 
   @Override
-  public boolean allowOsBuffer() {
+  public Options setUseDirectReads(final boolean useDirectReads) {
     assert(isOwningHandle());
-    return allowOsBuffer(nativeHandle_);
+    setUseDirectReads(nativeHandle_, useDirectReads);
+    return this;
   }
 
   @Override
-  public Options setAllowOsBuffer(final boolean allowOsBuffer) {
+  public boolean useDirectReads() {
     assert(isOwningHandle());
-    setAllowOsBuffer(nativeHandle_, allowOsBuffer);
+    return useDirectReads(nativeHandle_);
+  }
+
+  @Override
+  public Options setUseDirectWrites(final boolean useDirectWrites) {
+    assert(isOwningHandle());
+    setUseDirectWrites(nativeHandle_, useDirectWrites);
     return this;
   }
+
+  @Override
+  public boolean useDirectWrites() {
+    assert(isOwningHandle());
+    return useDirectWrites(nativeHandle_);
+  }
+
 
   @Override
   public boolean allowMmapReads() {
@@ -679,13 +680,6 @@ public class Options extends RocksObject
   public Options setMemTableConfig(final MemTableConfig config) {
     memTableConfig_ = config;
     setMemTableFactory(nativeHandle_, config.newMemTableFactoryHandle());
-    return this;
-  }
-
-  @Override
-  public Options setRateLimiterConfig(final RateLimiterConfig config) {
-    rateLimiterConfig_ = config;
-    setOldRateLimiter(nativeHandle_, config.newRateLimiterHandle());
     return this;
   }
 
@@ -904,12 +898,12 @@ public class Options extends RocksObject
   }
 
   @Override
-  public int maxBytesForLevelMultiplier() {
+  public double maxBytesForLevelMultiplier() {
     return maxBytesForLevelMultiplier(nativeHandle_);
   }
 
   @Override
-  public Options setMaxBytesForLevelMultiplier(final int multiplier) {
+  public Options setMaxBytesForLevelMultiplier(final double multiplier) {
     setMaxBytesForLevelMultiplier(nativeHandle_, multiplier);
     return this;
   }
@@ -997,19 +991,6 @@ public class Options extends RocksObject
   }
 
   @Override
-  public boolean verifyChecksumsInCompaction() {
-    return verifyChecksumsInCompaction(nativeHandle_);
-  }
-
-  @Override
-  public Options setVerifyChecksumsInCompaction(
-      final boolean verifyChecksumsInCompaction) {
-    setVerifyChecksumsInCompaction(
-        nativeHandle_, verifyChecksumsInCompaction);
-    return this;
-  }
-
-  @Override
   public long maxSequentialSkipInIterations() {
     return maxSequentialSkipInIterations(nativeHandle_);
   }
@@ -1088,18 +1069,6 @@ public class Options extends RocksObject
   public Options setMinWriteBufferNumberToMerge(
       final int minWriteBufferNumberToMerge) {
     setMinWriteBufferNumberToMerge(nativeHandle_, minWriteBufferNumberToMerge);
-    return this;
-  }
-
-  @Override
-  public int minPartialMergeOperands() {
-    return minPartialMergeOperands(nativeHandle_);
-  }
-
-  @Override
-  public Options setMinPartialMergeOperands(
-      final int minPartialMergeOperands) {
-    setMinPartialMergeOperands(nativeHandle_, minPartialMergeOperands);
     return this;
   }
 
@@ -1226,9 +1195,6 @@ public class Options extends RocksObject
   private native void setParanoidChecks(
       long handle, boolean paranoidChecks);
   private native boolean paranoidChecks(long handle);
-  @Deprecated
-  private native void setOldRateLimiter(long handle,
-      long rateLimiterHandle);
   private native void setRateLimiter(long handle,
       long rateLimiterHandle);
   private native void setLogger(long handle,
@@ -1242,8 +1208,6 @@ public class Options extends RocksObject
   private native long maxTotalWalSize(long handle);
   private native void createStatistics(long optHandle);
   private native long statisticsPtr(long optHandle);
-  private native void setDisableDataSync(long handle, boolean disableDataSync);
-  private native boolean disableDataSync(long handle);
   private native boolean useFsync(long handle);
   private native void setUseFsync(long handle, boolean useFsync);
   private native void setDbLogDir(long handle, String dbLogDir);
@@ -1289,9 +1253,10 @@ public class Options extends RocksObject
   private native void setManifestPreallocationSize(
       long handle, long size) throws IllegalArgumentException;
   private native long manifestPreallocationSize(long handle);
-  private native void setAllowOsBuffer(
-      long handle, boolean allowOsBuffer);
-  private native boolean allowOsBuffer(long handle);
+  private native void setUseDirectReads(long handle, boolean useDirectReads);
+  private native boolean useDirectReads(long handle);
+  private native void setUseDirectWrites(long handle, boolean useDirectWrites);
+  private native boolean useDirectWrites(long handle);
   private native void setAllowMmapReads(
       long handle, boolean allowMmapReads);
   private native boolean allowMmapReads(long handle);
@@ -1382,9 +1347,8 @@ public class Options extends RocksObject
       long handle, boolean enableLevelCompactionDynamicLevelBytes);
   private native boolean levelCompactionDynamicLevelBytes(
       long handle);
-  private native void setMaxBytesForLevelMultiplier(
-      long handle, int multiplier);
-  private native int maxBytesForLevelMultiplier(long handle);
+  private native void setMaxBytesForLevelMultiplier(long handle, double multiplier);
+  private native double maxBytesForLevelMultiplier(long handle);
   private native void setMaxCompactionBytes(long handle, long maxCompactionBytes);
   private native long maxCompactionBytes(long handle);
   private native void setSoftRateLimit(
@@ -1407,9 +1371,6 @@ public class Options extends RocksObject
   private native void setPurgeRedundantKvsWhileFlush(
       long handle, boolean purgeRedundantKvsWhileFlush);
   private native boolean purgeRedundantKvsWhileFlush(long handle);
-  private native void setVerifyChecksumsInCompaction(
-      long handle, boolean verifyChecksumsInCompaction);
-  private native boolean verifyChecksumsInCompaction(long handle);
   private native void setMaxSequentialSkipInIterations(
       long handle, long maxSequentialSkipInIterations);
   private native long maxSequentialSkipInIterations(long handle);
@@ -1434,9 +1395,6 @@ public class Options extends RocksObject
       long handle, long maxSuccessiveMerges)
       throws IllegalArgumentException;
   private native long maxSuccessiveMerges(long handle);
-  private native void setMinPartialMergeOperands(
-      long handle, int minPartialMergeOperands);
-  private native int minPartialMergeOperands(long handle);
   private native void setOptimizeFiltersForHits(long handle,
       boolean optimizeFiltersForHits);
   private native boolean optimizeFiltersForHits(long handle);
@@ -1468,7 +1426,6 @@ public class Options extends RocksObject
   Env env_;
   MemTableConfig memTableConfig_;
   TableFormatConfig tableFormatConfig_;
-  RateLimiterConfig rateLimiterConfig_;
   RateLimiter rateLimiter_;
   AbstractComparator<? extends AbstractSlice<?>> comparator_;
 }

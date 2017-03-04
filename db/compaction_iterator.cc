@@ -14,8 +14,25 @@ CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
     SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
     SequenceNumber earliest_write_conflict_snapshot, Env* env,
-    bool expect_valid_internal_key, const Compaction* compaction,
-    const CompactionFilter* compaction_filter, LogBuffer* log_buffer)
+    bool expect_valid_internal_key, RangeDelAggregator* range_del_agg,
+    const Compaction* compaction, const CompactionFilter* compaction_filter,
+    const std::atomic<bool>* shutting_down)
+    : CompactionIterator(
+          input, cmp, merge_helper, last_sequence, snapshots,
+          earliest_write_conflict_snapshot, env, expect_valid_internal_key,
+          range_del_agg,
+          std::unique_ptr<CompactionProxy>(
+              compaction ? new CompactionProxy(compaction) : nullptr),
+          compaction_filter, shutting_down) {}
+
+CompactionIterator::CompactionIterator(
+    InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
+    SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
+    SequenceNumber earliest_write_conflict_snapshot, Env* env,
+    bool expect_valid_internal_key, RangeDelAggregator* range_del_agg,
+    std::unique_ptr<CompactionProxy> compaction,
+    const CompactionFilter* compaction_filter,
+    const std::atomic<bool>* shutting_down)
     : input_(input),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -23,9 +40,10 @@ CompactionIterator::CompactionIterator(
       earliest_write_conflict_snapshot_(earliest_write_conflict_snapshot),
       env_(env),
       expect_valid_internal_key_(expect_valid_internal_key),
-      compaction_(compaction),
+      range_del_agg_(range_del_agg),
+      compaction_(std::move(compaction)),
       compaction_filter_(compaction_filter),
-      log_buffer_(log_buffer),
+      shutting_down_(shutting_down),
       merge_out_iter_(merge_helper_) {
   assert(compaction_filter_ == nullptr || compaction_ != nullptr);
   bottommost_level_ =
@@ -61,6 +79,8 @@ void CompactionIterator::ResetRecordCounts() {
   iter_stats_.num_record_drop_user = 0;
   iter_stats_.num_record_drop_hidden = 0;
   iter_stats_.num_record_drop_obsolete = 0;
+  iter_stats_.num_record_drop_range_del = 0;
+  iter_stats_.num_range_del_drop_obsolete = 0;
 }
 
 void CompactionIterator::SeekToFirst() {
@@ -106,7 +126,7 @@ void CompactionIterator::Next() {
   }
 
   if (valid_) {
-    // Record that we've ouputted a record for the current key.
+    // Record that we've outputted a record for the current key.
     has_outputted_key_ = true;
   }
 
@@ -117,7 +137,7 @@ void CompactionIterator::NextFromInput() {
   at_next_ = false;
   valid_ = false;
 
-  while (!valid_ && input_->Valid()) {
+  while (!valid_ && input_->Valid() && !IsShuttingDown()) {
     key_ = input_->key();
     value_ = input_->value();
     iter_stats_.num_input_records++;
@@ -147,12 +167,20 @@ void CompactionIterator::NextFromInput() {
     iter_stats_.total_input_raw_key_bytes += key_.size();
     iter_stats_.total_input_raw_value_bytes += value_.size();
 
+    // If need_skip is true, we should seek the input iterator
+    // to internal key skip_until and continue from there.
+    bool need_skip = false;
+    // Points either into compaction_filter_skip_until_ or into
+    // merge_helper_->compaction_filter_skip_until_.
+    Slice skip_until;
+
     // Check whether the user key changed. After this if statement current_key_
     // is a copy of the current input key (maybe converted to a delete by the
     // compaction filter). ikey_.user_key is pointing to the copy.
     if (!has_current_user_key_ ||
         !cmp_->Equal(ikey_.user_key, current_user_key_)) {
       // First occurrence of this user key
+      // Copy key for output
       key_ = current_key_.SetKey(key_, &ikey_);
       current_user_key_ = ikey_.user_key;
       has_current_user_key_ = true;
@@ -168,26 +196,42 @@ void CompactionIterator::NextFromInput() {
         // number is greater than any external snapshot, then invoke the
         // filter. If the return value of the compaction filter is true,
         // replace the entry with a deletion marker.
-        bool value_changed = false;
-        bool to_delete = false;
+        CompactionFilter::Decision filter;
         compaction_filter_value_.clear();
+        compaction_filter_skip_until_.Clear();
         {
           StopWatchNano timer(env_, true);
-          to_delete = compaction_filter_->Filter(
-              compaction_->level(), ikey_.user_key, value_,
-              &compaction_filter_value_, &value_changed);
+          filter = compaction_filter_->FilterV2(
+              compaction_->level(), ikey_.user_key,
+              CompactionFilter::ValueType::kValue, value_,
+              &compaction_filter_value_, compaction_filter_skip_until_.rep());
           iter_stats_.total_filter_time +=
               env_ != nullptr ? timer.ElapsedNanos() : 0;
         }
-        if (to_delete) {
-          // convert the current key to a delete
+
+        if (filter == CompactionFilter::Decision::kRemoveAndSkipUntil &&
+            cmp_->Compare(*compaction_filter_skip_until_.rep(),
+                          ikey_.user_key) <= 0) {
+          // Can't skip to a key smaller than the current one.
+          // Keep the key as per FilterV2 documentation.
+          filter = CompactionFilter::Decision::kKeep;
+        }
+
+        if (filter == CompactionFilter::Decision::kRemove) {
+          // convert the current key to a delete; key_ is pointing into
+          // current_key_ at this point, so updating current_key_ updates key()
           ikey_.type = kTypeDeletion;
           current_key_.UpdateInternalKey(ikey_.sequence, kTypeDeletion);
           // no value associated with delete
           value_.clear();
           iter_stats_.num_record_drop_user++;
-        } else if (value_changed) {
+        } else if (filter == CompactionFilter::Decision::kChangeValue) {
           value_ = compaction_filter_value_;
+        } else if (filter == CompactionFilter::Decision::kRemoveAndSkipUntil) {
+          need_skip = true;
+          compaction_filter_skip_until_.ConvertFromUserKey(kMaxSequenceNumber,
+                                                           kValueTypeForSeek);
+          skip_until = compaction_filter_skip_until_.Encode();
         }
       }
     } else {
@@ -214,7 +258,9 @@ void CompactionIterator::NextFromInput() {
             ? earliest_snapshot_
             : findEarliestVisibleSnapshot(ikey_.sequence, &prev_snapshot);
 
-    if (clear_and_output_next_key_) {
+    if (need_skip) {
+      // This case is handled below.
+    } else if (clear_and_output_next_key_) {
       // In the previous iteration we encountered a single delete that we could
       // not compact out.  We will keep this Put, but can drop it's data.
       // (See Optimization 3, below.)
@@ -305,7 +351,6 @@ void CompactionIterator::NextFromInput() {
             // to know that a write happened in this snapshot (Rule 2 above).
             // Clear the value and output the SingleDelete. (The value will be
             // outputted on the next iteration.)
-            ++iter_stats_.num_record_drop_hidden;
 
             // Setting valid_ to true will output the current SingleDelete
             valid_ = true;
@@ -321,7 +366,7 @@ void CompactionIterator::NextFromInput() {
         }
       } else {
         // We are at the end of the input, could not parse the next key, or hit
-        // the next key. The iterator returns the single delete if the key
+        // a different key. The iterator returns the single delete if the key
         // possibly exists beyond the current output level.  We set
         // has_current_user_key to false so that if the iterator is at the next
         // key, we do not compare it again against the previous key at the next
@@ -379,7 +424,6 @@ void CompactionIterator::NextFromInput() {
       input_->Next();
     } else if (ikey_.type == kTypeMerge) {
       if (!merge_helper_->HasOperator()) {
-        LogToBuffer(log_buffer_, "Options::merge_operator is null.");
         status_ = Status::InvalidArgument(
             "merge_operator is not properly initialized.");
         return;
@@ -390,10 +434,14 @@ void CompactionIterator::NextFromInput() {
       // have hit (A)
       // We encapsulate the merge related state machine in a different
       // object to minimize change to the existing flow.
-      merge_helper_->MergeUntil(input_, prev_snapshot, bottommost_level_);
+      Status s = merge_helper_->MergeUntil(input_, range_del_agg_,
+                                           prev_snapshot, bottommost_level_);
       merge_out_iter_.SeekToFirst();
 
-      if (merge_out_iter_.Valid()) {
+      if (!s.ok() && !s.IsMergeInProgress()) {
+        status_ = s;
+        return;
+      } else if (merge_out_iter_.Valid()) {
         // NOTE: key, value, and ikey_ refer to old entries.
         //       These will be correctly set below.
         key_ = merge_out_iter_.key();
@@ -414,10 +462,32 @@ void CompactionIterator::NextFromInput() {
         // coming after the merges
         has_current_user_key_ = false;
         pinned_iters_mgr_.ReleasePinnedData();
+
+        if (merge_helper_->FilteredUntil(&skip_until)) {
+          need_skip = true;
+        }
       }
     } else {
-      valid_ = true;
+      // 1. new user key -OR-
+      // 2. different snapshot stripe
+      bool should_delete = range_del_agg_->ShouldDelete(
+          key_, RangeDelAggregator::RangePositioningMode::kForwardTraversal);
+      if (should_delete) {
+        ++iter_stats_.num_record_drop_hidden;
+        ++iter_stats_.num_record_drop_range_del;
+        input_->Next();
+      } else {
+        valid_ = true;
+      }
     }
+
+    if (need_skip) {
+      input_->Seek(skip_until);
+    }
+  }
+
+  if (!valid_ && IsShuttingDown()) {
+    status_ = Status::ShutdownInProgress();
   }
 }
 

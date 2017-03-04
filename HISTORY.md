@@ -1,8 +1,65 @@
 # Rocksdb Change Log
 ## Unreleased
 ### Public API Change
+* Remove disableDataSync option.
+* Remove timeout_hint_us option from WriteOptions. The option has been deprecated and has no effect since 3.13.0.
+* Remove option min_partial_merge_operands. Partial merge operands will always be merged in flush or compaction if there are more than one.
+* Remove option verify_checksums_in_compaction. Compaction will always verify checksum.
+
+## 5.2.0 (02/08/2017)
+### Public API Change
+* NewLRUCache() will determine number of shard bits automatically based on capacity, if the user doesn't pass one. This also impacts the default block cache when the user doesn't explict provide one.
+* Change the default of delayed slowdown value to 16MB/s and further increase the L0 stop condition to 36 files.
+* Options::use_direct_writes and Options::use_direct_reads are now ready to use.
+* (Experimental) Two-level indexing that partition the index and creates a 2nd level index on the partitions. The feature can be enabled by setting kTwoLevelIndexSearch as IndexType and configuring index_per_partition.
+
+### New Features
+* Added new overloaded function GetApproximateSizes that allows to specify if memtable stats should be computed only without computing SST files' stats approximations.
+* Added new function GetApproximateMemTableStats that approximates both number of records and size of memtables.
+* Add Direct I/O mode for SST file I/O
+
+### Bug Fixes
+* RangeSync() should work if ROCKSDB_FALLOCATE_PRESENT is not set
+* Fix wrong results in a data race case in Get()
+* Some fixes related to 2PC.
+* Fix bugs of data corruption in direct I/O
+
+## 5.1.0 (01/13/2017)
+* Support dynamically change `delete_obsolete_files_period_micros` option via SetDBOptions().
+* Added EventListener::OnExternalFileIngested which will be called when IngestExternalFile() add a file successfully.
+* BackupEngine::Open and BackupEngineReadOnly::Open now always return error statuses matching those of the backup Env.
+
+### Bug Fixes
+* Fix the bug that if 2PC is enabled, checkpoints may loss some recent transactions.
+* When file copying is needed when creating checkpoints or bulk loading files, fsync the file after the file copying.
+
+## 5.0.0 (11/17/2016)
+### Public API Change
+* Options::max_bytes_for_level_multiplier is now a double along with all getters and setters.
+* Support dynamically change `delayed_write_rate` and `max_total_wal_size` options via SetDBOptions().
+* Introduce DB::DeleteRange for optimized deletion of large ranges of contiguous keys.
+* Support dynamically change `delayed_write_rate` option via SetDBOptions().
+* Options::allow_concurrent_memtable_write and Options::enable_write_thread_adaptive_yield are now true by default.
+* Remove Tickers::SEQUENCE_NUMBER to avoid confusion if statistics object is shared among RocksDB instance. Alternatively DB::GetLatestSequenceNumber() can be used to get the same value.
+* Options.level0_stop_writes_trigger default value changes from 24 to 32.
+* New compaction filter API: CompactionFilter::FilterV2(). Allows to drop ranges of keys.
+* Removed flashcache support.
+* DB::AddFile() is deprecated and is replaced with DB::IngestExternalFile(). DB::IngestExternalFile() remove all the restrictions that existed for DB::AddFile.
+
+### New Features
+* Add avoid_flush_during_shutdown option, which speeds up DB shutdown by not flushing unpersisted data (i.e. with disableWAL = true). Unpersisted data will be lost. The options is dynamically changeable via SetDBOptions().
+* Add memtable_insert_with_hint_prefix_extractor option. The option is mean to reduce CPU usage for inserting keys into memtable, if keys can be group by prefix and insert for each prefix are sequential or almost sequential. See include/rocksdb/options.h for more details.
+* Add LuaCompactionFilter in utilities.  This allows developers to write compaction filters in Lua.  To use this feature, LUA_PATH needs to be set to the root directory of Lua.
+* No longer populate "LATEST_BACKUP" file in backup directory, which formerly contained the number of the latest backup. The latest backup can be determined by finding the highest numbered file in the "meta/" subdirectory.
+
+## 4.13.0 (10/18/2016)
+### Public API Change
 * DB::GetOptions() reflect dynamic changed options (i.e. through DB::SetOptions()) and return copy of options instead of reference.
 * Added Statistics::getAndResetTickerCount().
+
+### New Features
+* Add DB::SetDBOptions() to dynamic change base_background_compactions and max_background_compactions.
+* Added Iterator::SeekForPrev(). This new API will seek to the last key that less than or equal to the target key.
 
 ## 4.12.0 (9/12/2016)
 ### Public API Change

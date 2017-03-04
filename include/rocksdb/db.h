@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -31,6 +32,11 @@
 #undef DeleteFile
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define ROCKSDB_DEPRECATED_FUNC __attribute__((__deprecated__))
+#elif _WIN32
+#define ROCKSDB_DEPRECATED_FUNC __declspec(deprecated)
+#endif
 
 namespace rocksdb {
 
@@ -229,6 +235,25 @@ class DB {
     return SingleDelete(options, DefaultColumnFamily(), key);
   }
 
+  // Removes the database entries in the range ["begin_key", "end_key"), i.e.,
+  // including "begin_key" and excluding "end_key". Returns OK on success, and
+  // a non-OK status on error. It is not an error if no keys exist in the range
+  // ["begin_key", "end_key").
+  //
+  // This feature is currently an experimental performance optimization for
+  // deleting very large ranges of contiguous keys. Invoking it many times or on
+  // small ranges may severely degrade read performance; in particular, the
+  // resulting performance can be worse than calling Delete() for each key in
+  // the range. Note also the degraded read performance affects keys outside the
+  // deleted ranges, and affects database operations involving scans, like flush
+  // and compaction.
+  //
+  // Consider setting ReadOptions::ignore_range_deletions = true to speed
+  // up reads for key(s) that are known to be unaffected by range deletions.
+  virtual Status DeleteRange(const WriteOptions& options,
+                             ColumnFamilyHandle* column_family,
+                             const Slice& begin_key, const Slice& end_key);
+
   // Merge the database entry for "key" with "value".  Returns OK on success,
   // and a non-OK status on error. The semantics of this operation is
   // determined by the user provided merge_operator when opening DB.
@@ -367,6 +392,10 @@ class DB {
     //      family stats per-level over db's lifetime ("L<n>"), aggregated over
     //      db's lifetime ("Sum"), and aggregated over the interval since the
     //      last retrieval ("Int").
+    //  It could also be used to return the stats in the format of the map.
+    //  In this case there will a pair of string to array of double for
+    //  each level as well as for "Sum". "Int" stats will not be affected
+    //  when this form of stats are retrived.
     static const std::string kCFStats;
 
     //  "rocksdb.dbstats" - returns a multi-line string with general database
@@ -435,7 +464,7 @@ class DB {
     static const std::string kNumDeletesImmMemTables;
 
     //  "rocksdb.estimate-num-keys" - returns estimated number of total keys in
-    //      the active and unflushed immutable memtables.
+    //      the active and unflushed immutable memtables and storage.
     static const std::string kEstimateNumKeys;
 
     //  "rocksdb.estimate-table-readers-mem" - returns estimated memory used for
@@ -470,6 +499,10 @@ class DB {
     //  "rocksdb.estimate-live-data-size" - returns an estimate of the amount of
     //      live data in bytes.
     static const std::string kEstimateLiveDataSize;
+
+    //  "rocksdb.min-log-number-to-keep" - return the minmum log number of the
+    //      log files that should be kept.
+    static const std::string kMinLogNumberToKeep;
 
     //  "rocksdb.total-sst-files-size" - returns total size (bytes) of all SST
     //      files.
@@ -506,6 +539,13 @@ class DB {
   virtual bool GetProperty(const Slice& property, std::string* value) {
     return GetProperty(DefaultColumnFamily(), property, value);
   }
+  virtual bool GetMapProperty(ColumnFamilyHandle* column_family,
+                              const Slice& property,
+                              std::map<std::string, double>* value) = 0;
+  virtual bool GetMapProperty(const Slice& property,
+                              std::map<std::string, double>* value) {
+    return GetMapProperty(DefaultColumnFamily(), property, value);
+  }
 
   // Similar to GetProperty(), but only works for a subset of properties whose
   // return value is an integer. Return the value by integer. Supported
@@ -529,6 +569,7 @@ class DB {
   //  "rocksdb.num-live-versions"
   //  "rocksdb.current-super-version-number"
   //  "rocksdb.estimate-live-data-size"
+  //  "rocksdb.min-log-number-to-keep"
   //  "rocksdb.total-sst-files-size"
   //  "rocksdb.base-level"
   //  "rocksdb.estimate-pending-compaction-bytes"
@@ -545,6 +586,14 @@ class DB {
   virtual bool GetAggregatedIntProperty(const Slice& property,
                                         uint64_t* value) = 0;
 
+  // Flags for DB::GetSizeApproximation that specify whether memtable 
+  // stats should be included, or file stats approximation or both
+  enum SizeApproximationFlags : uint8_t {
+    NONE = 0,
+    INCLUDE_MEMTABLES = 1,
+    INCLUDE_FILES = 1 << 1
+  };
+
   // For each i in [0,n-1], store in "sizes[i]", the approximate
   // file system space used by keys in "[range[i].start .. range[i].limit)".
   //
@@ -552,16 +601,52 @@ class DB {
   // if the user data compresses by a factor of ten, the returned
   // sizes will be one-tenth the size of the corresponding user data size.
   //
-  // If include_memtable is set to true, then the result will also
-  // include those recently written data in the mem-tables if
-  // the mem-table type supports it.
+  // If include_flags defines whether the returned size should include
+  // the recently written data in the mem-tables (if
+  // the mem-table type supports it), data serialized to disk, or both.
+  // include_flags should be of type DB::SizeApproximationFlags
   virtual void GetApproximateSizes(ColumnFamilyHandle* column_family,
                                    const Range* range, int n, uint64_t* sizes,
-                                   bool include_memtable = false) = 0;
+                                   uint8_t include_flags
+                                   = INCLUDE_FILES) = 0;
   virtual void GetApproximateSizes(const Range* range, int n, uint64_t* sizes,
-                                   bool include_memtable = false) {
+                                   uint8_t include_flags
+                                   = INCLUDE_FILES) {
     GetApproximateSizes(DefaultColumnFamily(), range, n, sizes,
-                        include_memtable);
+                        include_flags);
+  }
+
+  // The method is similar to GetApproximateSizes, except it
+  // returns approximate number of records in memtables.
+  virtual void GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
+                                           const Range& range,
+                                           uint64_t* const count,
+                                           uint64_t* const size) = 0;
+  virtual void GetApproximateMemTableStats(const Range& range,
+                                           uint64_t* const count,
+                                           uint64_t* const size) {
+    GetApproximateMemTableStats(DefaultColumnFamily(), range, count, size);
+  }
+
+  // Deprecated versions of GetApproximateSizes
+  ROCKSDB_DEPRECATED_FUNC virtual void GetApproximateSizes(
+      const Range* range, int n, uint64_t* sizes,
+      bool include_memtable) {
+    uint8_t include_flags = SizeApproximationFlags::INCLUDE_FILES;
+    if (include_memtable) {
+      include_flags |= SizeApproximationFlags::INCLUDE_MEMTABLES;
+    }
+    GetApproximateSizes(DefaultColumnFamily(), range, n, sizes, include_flags);
+  }
+  ROCKSDB_DEPRECATED_FUNC virtual void GetApproximateSizes(
+      ColumnFamilyHandle* column_family,
+      const Range* range, int n, uint64_t* sizes,
+      bool include_memtable) {
+    uint8_t include_flags = SizeApproximationFlags::INCLUDE_FILES;
+    if (include_memtable) {
+      include_flags |= SizeApproximationFlags::INCLUDE_MEMTABLES;
+    }
+    GetApproximateSizes(column_family, range, n, sizes, include_flags);
   }
 
   // Compact the underlying storage for the key range [*begin,*end].
@@ -589,29 +674,20 @@ class DB {
     return CompactRange(options, DefaultColumnFamily(), begin, end);
   }
 
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  CompactRange(ColumnFamilyHandle* column_family, const Slice* begin,
-               const Slice* end, bool change_level = false,
-               int target_level = -1, uint32_t target_path_id = 0) {
+  ROCKSDB_DEPRECATED_FUNC virtual Status CompactRange(
+      ColumnFamilyHandle* column_family, const Slice* begin, const Slice* end,
+      bool change_level = false, int target_level = -1,
+      uint32_t target_path_id = 0) {
     CompactRangeOptions options;
     options.change_level = change_level;
     options.target_level = target_level;
     options.target_path_id = target_path_id;
     return CompactRange(options, column_family, begin, end);
   }
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  CompactRange(const Slice* begin, const Slice* end, bool change_level = false,
-               int target_level = -1, uint32_t target_path_id = 0) {
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status CompactRange(
+      const Slice* begin, const Slice* end, bool change_level = false,
+      int target_level = -1, uint32_t target_path_id = 0) {
     CompactRangeOptions options;
     options.change_level = change_level;
     options.target_level = target_level;
@@ -628,6 +704,9 @@ class DB {
       const std::unordered_map<std::string, std::string>& new_options) {
     return SetOptions(DefaultColumnFamily(), new_options);
   }
+
+  virtual Status SetDBOptions(
+      const std::unordered_map<std::string, std::string>& new_options) = 0;
 
   // CompactFiles() inputs a list of files specified by file numbers and
   // compacts them to the specified level. Note that the behavior is different
@@ -800,79 +879,126 @@ class DB {
     GetColumnFamilyMetaData(DefaultColumnFamily(), metadata);
   }
 
-  // Batch load table files whose paths stored in  "file_path_list" into
-  // "column_family", a vector of  ExternalSstFileInfo can be used
-  // instead of "file_path_list" to do a blind batch add that wont
-  // need to read the file, move_file can be set to true to
-  // move the files instead of copying them, skip_snapshot_check can be set to
-  // true to ignore the snapshot, make sure that you know that when you use it,
-  // snapshots see the data that is added in the new files.
+  // IngestExternalFile() will load a list of external SST files (1) into the DB
+  // We will try to find the lowest possible level that the file can fit in, and
+  // ingest the file into this level (2). A file that have a key range that
+  // overlap with the memtable key range will require us to Flush the memtable
+  // first before ingesting the file.
   //
-  // Current Requirements:
-  // (1) The key ranges of the files don't overlap with each other
-  // (2) The key range of any file in list doesn't overlap with
-  //     existing keys or tombstones in DB.
-  // (3) No snapshots are held (check skip_snapshot_check to skip this check).
-  //
-  // Notes: We will try to ingest the files to the lowest possible level
-  //        even if the file compression dont match the level compression
-  virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const std::vector<std::string>& file_path_list,
-                         bool move_file = false, bool skip_snapshot_check = false) = 0;
-  virtual Status AddFile(const std::vector<std::string>& file_path_list,
-                         bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(DefaultColumnFamily(), file_path_list, move_file, skip_snapshot_check);
+  // (1) External SST files can be created using SstFileWriter
+  // (2) We will try to ingest the files to the lowest possible level
+  //     even if the file compression dont match the level compression
+  virtual Status IngestExternalFile(
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::string>& external_files,
+      const IngestExternalFileOptions& options) = 0;
+
+  virtual Status IngestExternalFile(
+      const std::vector<std::string>& external_files,
+      const IngestExternalFileOptions& options) {
+    return IngestExternalFile(DefaultColumnFamily(), external_files, options);
   }
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  AddFile(ColumnFamilyHandle* column_family, const std::string& file_path,
-          bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(column_family, std::vector<std::string>(1, file_path),
-                   move_file, skip_snapshot_check);
+
+  // AddFile() is deprecated, please use IngestExternalFile()
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::string>& file_path_list, bool move_file = false,
+      bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(column_family, file_path_list, ifo);
   }
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  AddFile(const std::string& file_path, bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(DefaultColumnFamily(),
-                   std::vector<std::string>(1, file_path), move_file, skip_snapshot_check);
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      const std::vector<std::string>& file_path_list, bool move_file = false,
+      bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(DefaultColumnFamily(), file_path_list, ifo);
+  }
+
+  // AddFile() is deprecated, please use IngestExternalFile()
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      ColumnFamilyHandle* column_family, const std::string& file_path,
+      bool move_file = false, bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(column_family, {file_path}, ifo);
+  }
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      const std::string& file_path, bool move_file = false,
+      bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(DefaultColumnFamily(), {file_path}, ifo);
   }
 
   // Load table file with information "file_info" into "column_family"
-  virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const std::vector<ExternalSstFileInfo>& file_info_list,
-                         bool move_file = false, bool skip_snapshot_check = false) = 0;
-  virtual Status AddFile(const std::vector<ExternalSstFileInfo>& file_info_list,
-                         bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(DefaultColumnFamily(), file_info_list, move_file, skip_snapshot_check);
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      ColumnFamilyHandle* column_family,
+      const std::vector<ExternalSstFileInfo>& file_info_list,
+      bool move_file = false, bool skip_snapshot_check = false) {
+    std::vector<std::string> external_files;
+    for (const ExternalSstFileInfo& file_info : file_info_list) {
+      external_files.push_back(file_info.file_path);
+    }
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(column_family, external_files, ifo);
   }
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  AddFile(ColumnFamilyHandle* column_family,
-          const ExternalSstFileInfo* file_info, bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(column_family,
-                   std::vector<ExternalSstFileInfo>(1, *file_info), move_file, skip_snapshot_check);
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      const std::vector<ExternalSstFileInfo>& file_info_list,
+      bool move_file = false, bool skip_snapshot_check = false) {
+    std::vector<std::string> external_files;
+    for (const ExternalSstFileInfo& file_info : file_info_list) {
+      external_files.push_back(file_info.file_path);
+    }
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(DefaultColumnFamily(), external_files, ifo);
   }
-#if defined(__GNUC__) || defined(__clang__)
-  __attribute__((__deprecated__))
-#elif _WIN32
-  __declspec(deprecated)
-#endif
-  virtual Status
-  AddFile(const ExternalSstFileInfo* file_info, bool move_file = false, bool skip_snapshot_check = false) {
-    return AddFile(DefaultColumnFamily(),
-                   std::vector<ExternalSstFileInfo>(1, *file_info), move_file, skip_snapshot_check);
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      ColumnFamilyHandle* column_family, const ExternalSstFileInfo* file_info,
+      bool move_file = false, bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(column_family, {file_info->file_path}, ifo);
+  }
+
+  ROCKSDB_DEPRECATED_FUNC virtual Status AddFile(
+      const ExternalSstFileInfo* file_info, bool move_file = false,
+      bool skip_snapshot_check = false) {
+    IngestExternalFileOptions ifo;
+    ifo.move_files = move_file;
+    ifo.snapshot_consistency = !skip_snapshot_check;
+    ifo.allow_global_seqno = false;
+    ifo.allow_blocking_flush = false;
+    return IngestExternalFile(DefaultColumnFamily(), {file_info->file_path},
+                              ifo);
   }
 
 #endif  // ROCKSDB_LITE

@@ -209,10 +209,11 @@ class Transaction {
   // or other errors if this key could not be read.
   virtual Status GetForUpdate(const ReadOptions& options,
                               ColumnFamilyHandle* column_family,
-                              const Slice& key, std::string* value) = 0;
+                              const Slice& key, std::string* value,
+                              bool exclusive = true) = 0;
 
   virtual Status GetForUpdate(const ReadOptions& options, const Slice& key,
-                              std::string* value) = 0;
+                              std::string* value, bool exclusive = true) = 0;
 
   virtual std::vector<Status> MultiGetForUpdate(
       const ReadOptions& options,
@@ -399,10 +400,12 @@ class Transaction {
 
   virtual TransactionID GetID() const { return 0; }
 
-  virtual TransactionID GetWaitingTxn(uint32_t* column_family_id,
-                                      const std::string** key) const {
+  virtual bool IsDeadlockDetect() const { return false; }
+
+  virtual std::vector<TransactionID> GetWaitingTxns(uint32_t* column_family_id,
+                                                    std::string* key) const {
     assert(false);
-    return 0;
+    return std::vector<TransactionID>();
   }
 
   enum TransactionState {

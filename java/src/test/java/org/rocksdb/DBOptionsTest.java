@@ -126,15 +126,6 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void disableDataSync() {
-    try(final DBOptions opt = new DBOptions()) {
-      final boolean boolValue = rand.nextBoolean();
-      opt.setDisableDataSync(boolValue);
-      assertThat(opt.disableDataSync()).isEqualTo(boolValue);
-    }
-  }
-
-  @Test
   public void useFsync() {
     try(final DBOptions opt = new DBOptions()) {
       final boolean boolValue = rand.nextBoolean();
@@ -281,11 +272,20 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void allowOsBuffer() {
+  public void useDirectReads() {
     try(final DBOptions opt = new DBOptions()) {
       final boolean boolValue = rand.nextBoolean();
-      opt.setAllowOsBuffer(boolValue);
-      assertThat(opt.allowOsBuffer()).isEqualTo(boolValue);
+      opt.setUseDirectReads(boolValue);
+      assertThat(opt.useDirectReads()).isEqualTo(boolValue);
+    }
+  }
+
+  @Test
+  public void useDirectWrites() {
+    try(final DBOptions opt = new DBOptions()) {
+      final boolean boolValue = rand.nextBoolean();
+      opt.setUseDirectWrites(boolValue);
+      assertThat(opt.useDirectWrites()).isEqualTo(boolValue);
     }
   }
 
@@ -389,24 +389,10 @@ public class DBOptionsTest {
   }
 
   @Test
-  public void rateLimiterConfig() {
-    try(final DBOptions options = new DBOptions();
-        final DBOptions anotherOptions = new DBOptions()) {
-      final RateLimiterConfig rateLimiterConfig =
-          new GenericRateLimiterConfig(1000, 100 * 1000, 1);
-      options.setRateLimiterConfig(rateLimiterConfig);
-      // Test with parameter initialization
-
-      anotherOptions.setRateLimiterConfig(
-          new GenericRateLimiterConfig(1000));
-    }
-  }
-
-  @Test
   public void rateLimiter() {
     try(final DBOptions options = new DBOptions();
-        final DBOptions anotherOptions = new DBOptions()) {
-      final RateLimiter rateLimiter = new RateLimiter(1000, 100 * 1000, 1);
+        final DBOptions anotherOptions = new DBOptions();
+        final RateLimiter rateLimiter = new RateLimiter(1000, 100 * 1000, 1)) {
       options.setRateLimiter(rateLimiter);
       // Test with parameter initialization
       anotherOptions.setRateLimiter(

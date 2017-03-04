@@ -380,11 +380,12 @@ class Repairer {
       ScopedArenaIterator iter(mem->NewIterator(ro, &arena));
       status = BuildTable(
           dbname_, env_, *cfd->ioptions(), *cfd->GetLatestMutableCFOptions(),
-          env_options_, table_cache_, iter.get(), &meta,
-          cfd->internal_comparator(), cfd->int_tbl_prop_collector_factories(),
-          cfd->GetID(), cfd->GetName(), {}, kMaxSequenceNumber, kNoCompression,
-          CompressionOptions(), false, nullptr /* internal_stats */,
-          TableFileCreationReason::kRecovery);
+          env_options_, table_cache_, iter.get(),
+          std::unique_ptr<InternalIterator>(mem->NewRangeTombstoneIterator(ro)),
+          &meta, cfd->internal_comparator(),
+          cfd->int_tbl_prop_collector_factories(), cfd->GetID(), cfd->GetName(),
+          {}, kMaxSequenceNumber, kNoCompression, CompressionOptions(), false,
+          nullptr /* internal_stats */, TableFileCreationReason::kRecovery);
       Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
           "Log #%" PRIu64 ": %d ops saved to Table #%" PRIu64 " %s", log,
           counter, meta.fd.GetNumber(), status.ToString().c_str());
@@ -466,7 +467,8 @@ class Repairer {
     }
     if (status.ok()) {
       InternalIterator* iter = table_cache_->NewIterator(
-          ReadOptions(), env_options_, cfd->internal_comparator(), t->meta.fd);
+          ReadOptions(), env_options_, cfd->internal_comparator(), t->meta.fd,
+          nullptr /* range_del_agg */);
       bool empty = true;
       ParsedInternalKey parsed;
       t->min_sequence = 0;
@@ -484,6 +486,7 @@ class Repairer {
         if (empty) {
           empty = false;
           t->meta.smallest.DecodeFrom(key);
+          t->min_sequence = parsed.sequence;
         }
         t->meta.largest.DecodeFrom(key);
         if (parsed.sequence < t->min_sequence) {

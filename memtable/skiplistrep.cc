@@ -36,6 +36,10 @@ public:
     skip_list_.Insert(static_cast<char*>(handle));
   }
 
+  virtual void InsertWithHint(KeyHandle handle, void** hint) override {
+    skip_list_.InsertWithHint(static_cast<char*>(handle), hint);
+  }
+
   virtual void InsertConcurrently(KeyHandle handle) override {
     skip_list_.InsertConcurrently(static_cast<char*>(handle));
   }

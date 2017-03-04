@@ -68,7 +68,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"target_file_size_multiplier", "13"},
       {"max_bytes_for_level_base", "14"},
       {"level_compaction_dynamic_level_bytes", "true"},
-      {"max_bytes_for_level_multiplier", "15"},
+      {"max_bytes_for_level_multiplier", "15.0"},
       {"max_bytes_for_level_multiplier_additional", "16:17:18"},
       {"max_compaction_bytes", "21"},
       {"soft_rate_limit", "1.1"},
@@ -77,6 +77,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"arena_block_size", "22"},
       {"disable_auto_compactions", "true"},
       {"compaction_style", "kCompactionStyleLevel"},
+      {"compaction_pri", "kOldestSmallestSeqFirst"},
       {"verify_checksums_in_compaction", "false"},
       {"compaction_options_fifo", "23"},
       {"max_sequential_skip_in_iterations", "24"},
@@ -100,7 +101,6 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"paranoid_checks", "true"},
       {"max_open_files", "32"},
       {"max_total_wal_size", "33"},
-      {"disable_data_sync", "false"},
       {"use_fsync", "true"},
       {"db_log_dir", "/db_log_dir"},
       {"wal_dir", "/wal_dir"},
@@ -116,9 +116,10 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"WAL_ttl_seconds", "43"},
       {"WAL_size_limit_MB", "44"},
       {"manifest_preallocation_size", "45"},
-      {"allow_os_buffer", "false"},
       {"allow_mmap_reads", "true"},
       {"allow_mmap_writes", "false"},
+      {"use_direct_reads", "false"},
+      {"use_direct_writes", "false"},
       {"is_fd_close_on_exec", "true"},
       {"skip_log_error_on_recovery", "false"},
       {"stats_dump_period_sec", "46"},
@@ -164,7 +165,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.target_file_size_multiplier, 13);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_base, 14U);
   ASSERT_EQ(new_cf_opt.level_compaction_dynamic_level_bytes, true);
-  ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier, 15);
+  ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier, 15.0);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional.size(), 3U);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional[0], 16);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional[1], 17);
@@ -174,7 +175,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.arena_block_size, 22U);
   ASSERT_EQ(new_cf_opt.disable_auto_compactions, true);
   ASSERT_EQ(new_cf_opt.compaction_style, kCompactionStyleLevel);
-  ASSERT_EQ(new_cf_opt.verify_checksums_in_compaction, false);
+  ASSERT_EQ(new_cf_opt.compaction_pri, kOldestSmallestSeqFirst);
   ASSERT_EQ(new_cf_opt.compaction_options_fifo.max_table_files_size,
             static_cast<uint64_t>(23));
   ASSERT_EQ(new_cf_opt.max_sequential_skip_in_iterations,
@@ -185,7 +186,6 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.memtable_huge_page_size, 28U);
   ASSERT_EQ(new_cf_opt.bloom_locality, 29U);
   ASSERT_EQ(new_cf_opt.max_successive_merges, 30U);
-  ASSERT_EQ(new_cf_opt.min_partial_merge_operands, 31U);
   ASSERT_TRUE(new_cf_opt.prefix_extractor != nullptr);
   ASSERT_EQ(new_cf_opt.optimize_filters_for_hits, true);
   ASSERT_EQ(std::string(new_cf_opt.prefix_extractor->Name()),
@@ -214,7 +214,6 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_db_opt.paranoid_checks, true);
   ASSERT_EQ(new_db_opt.max_open_files, 32);
   ASSERT_EQ(new_db_opt.max_total_wal_size, static_cast<uint64_t>(33));
-  ASSERT_EQ(new_db_opt.disableDataSync, false);
   ASSERT_EQ(new_db_opt.use_fsync, true);
   ASSERT_EQ(new_db_opt.db_log_dir, "/db_log_dir");
   ASSERT_EQ(new_db_opt.wal_dir, "/wal_dir");
@@ -231,9 +230,10 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_db_opt.WAL_ttl_seconds, static_cast<uint64_t>(43));
   ASSERT_EQ(new_db_opt.WAL_size_limit_MB, static_cast<uint64_t>(44));
   ASSERT_EQ(new_db_opt.manifest_preallocation_size, 45U);
-  ASSERT_EQ(new_db_opt.allow_os_buffer, false);
   ASSERT_EQ(new_db_opt.allow_mmap_reads, true);
   ASSERT_EQ(new_db_opt.allow_mmap_writes, false);
+  ASSERT_EQ(new_db_opt.use_direct_reads, false);
+  ASSERT_EQ(new_db_opt.use_direct_writes, false);
   ASSERT_EQ(new_db_opt.is_fd_close_on_exec, true);
   ASSERT_EQ(new_db_opt.skip_log_error_on_recovery, false);
   ASSERT_EQ(new_db_opt.stats_dump_period_sec, 46U);
@@ -305,8 +305,8 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
 
   // Units (k)
   ASSERT_OK(GetColumnFamilyOptionsFromString(
-      base_cf_opt, "max_write_buffer_number=-15K", &new_cf_opt));
-  ASSERT_EQ(new_cf_opt.max_write_buffer_number, -15 * kilo);
+      base_cf_opt, "max_write_buffer_number=15K", &new_cf_opt));
+  ASSERT_EQ(new_cf_opt.max_write_buffer_number, 15 * kilo);
   // Units (m)
   ASSERT_OK(GetColumnFamilyOptionsFromString(base_cf_opt,
             "max_write_buffer_number=16m;inplace_update_num_locks=17M",
@@ -437,8 +437,7 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
             "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
             "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
             "block_size_deviation=8;block_restart_interval=4;"
-            "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
-            "skip_table_builder_flush=1",
+            "filter_policy=bloomfilter:4:true;whole_key_filtering=1;",
             &new_opt));
   ASSERT_TRUE(new_opt.cache_index_and_filter_blocks);
   ASSERT_EQ(new_opt.index_type, BlockBasedTableOptions::kHashSearch);
@@ -453,7 +452,6 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_EQ(new_opt.block_size_deviation, 8);
   ASSERT_EQ(new_opt.block_restart_interval, 4);
   ASSERT_TRUE(new_opt.filter_policy != nullptr);
-  ASSERT_TRUE(new_opt.skip_table_builder_flush);
 
   // unknown option
   ASSERT_NOK(GetBlockBasedTableOptionsFromString(table_opt,
@@ -1287,6 +1285,7 @@ TEST_F(OptionsParserTest, DifferentDefault) {
     ASSERT_EQ(10 * 1048576, old_default_opts.max_bytes_for_level_base);
     ASSERT_EQ(5000, old_default_opts.max_open_files);
     ASSERT_EQ(-1, old_default_opts.base_background_compactions);
+    ASSERT_EQ(2 * 1024U * 1024U, old_default_opts.delayed_write_rate);
     ASSERT_EQ(WALRecoveryMode::kTolerateCorruptedTailRecords,
               old_default_opts.wal_recovery_mode);
   }
@@ -1302,6 +1301,7 @@ TEST_F(OptionsParserTest, DifferentDefault) {
     ASSERT_NE(10 * 1048576, old_default_opts.max_bytes_for_level_base);
     ASSERT_NE(4, old_default_opts.table_cache_numshardbits);
     ASSERT_EQ(5000, old_default_opts.max_open_files);
+    ASSERT_EQ(2 * 1024U * 1024U, old_default_opts.delayed_write_rate);
   }
   {
     ColumnFamilyOptions old_default_cf_opts;
@@ -1327,6 +1327,16 @@ TEST_F(OptionsParserTest, DifferentDefault) {
     ASSERT_NE(2 * 1048576, old_default_cf_opts.target_file_size_base);
     ASSERT_EQ(CompactionPri::kByCompensatedSize,
               old_default_cf_opts.compaction_pri);
+  }
+  {
+    Options old_default_opts;
+    old_default_opts.OldDefaults(5, 1);
+    ASSERT_EQ(2 * 1024U * 1024U, old_default_opts.delayed_write_rate);
+  }
+  {
+    Options old_default_opts;
+    old_default_opts.OldDefaults(5, 2);
+    ASSERT_EQ(16 * 1024U * 1024U, old_default_opts.delayed_write_rate);
   }
 
   Options small_opts;

@@ -135,9 +135,9 @@ public class OptionsTest {
   @Test
   public void maxBytesForLevelMultiplier() {
     try (final Options opt = new Options()) {
-      final int intValue = rand.nextInt();
-      opt.setMaxBytesForLevelMultiplier(intValue);
-      assertThat(opt.maxBytesForLevelMultiplier()).isEqualTo(intValue);
+      final double doubleValue = rand.nextDouble();
+      opt.setMaxBytesForLevelMultiplier(doubleValue);
+      assertThat(opt.maxBytesForLevelMultiplier()).isEqualTo(doubleValue);
     }
   }
 
@@ -261,15 +261,6 @@ public class OptionsTest {
   }
 
   @Test
-  public void verifyChecksumsInCompaction() {
-    try (final Options opt = new Options()) {
-      final boolean boolValue = rand.nextBoolean();
-      opt.setVerifyChecksumsInCompaction(boolValue);
-      assertThat(opt.verifyChecksumsInCompaction()).isEqualTo(boolValue);
-    }
-  }
-
-  @Test
   public void maxSequentialSkipInIterations() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
@@ -329,15 +320,6 @@ public class OptionsTest {
       final long longValue = rand.nextLong();
       opt.setMaxSuccessiveMerges(longValue);
       assertThat(opt.maxSuccessiveMerges()).isEqualTo(longValue);
-    }
-  }
-
-  @Test
-  public void minPartialMergeOperands() {
-    try (final Options opt = new Options()) {
-      final int intValue = rand.nextInt();
-      opt.setMinPartialMergeOperands(intValue);
-      assertThat(opt.minPartialMergeOperands()).isEqualTo(intValue);
     }
   }
 
@@ -405,16 +387,6 @@ public class OptionsTest {
       final int intValue = rand.nextInt();
       opt.setMaxOpenFiles(intValue);
       assertThat(opt.maxOpenFiles()).isEqualTo(intValue);
-    }
-  }
-
-  @Test
-  public void disableDataSync() {
-    try (final Options opt = new Options()) {
-      final boolean boolValue = rand.nextBoolean();
-      opt.setDisableDataSync(boolValue);
-      assertThat(opt.disableDataSync()).
-          isEqualTo(boolValue);
     }
   }
 
@@ -572,11 +544,20 @@ public class OptionsTest {
   }
 
   @Test
-  public void allowOsBuffer() {
-    try (final Options opt = new Options()) {
+  public void useDirectReads() {
+    try(final Options opt = new Options()) {
       final boolean boolValue = rand.nextBoolean();
-      opt.setAllowOsBuffer(boolValue);
-      assertThat(opt.allowOsBuffer()).isEqualTo(boolValue);
+      opt.setUseDirectReads(boolValue);
+      assertThat(opt.useDirectReads()).isEqualTo(boolValue);
+    }
+  }
+
+  @Test
+  public void useDirectWrites() {
+    try(final Options opt = new Options()) {
+      final boolean boolValue = rand.nextBoolean();
+      opt.setUseDirectWrites(boolValue);
+      assertThat(opt.useDirectWrites()).isEqualTo(boolValue);
     }
   }
 
@@ -716,16 +697,15 @@ public class OptionsTest {
 
   @Test
   public void compressionPerLevel() {
-    try (final ColumnFamilyOptions columnFamilyOptions =
-             new ColumnFamilyOptions()) {
-      assertThat(columnFamilyOptions.compressionPerLevel()).isEmpty();
+    try (final Options options = new Options()) {
+      assertThat(options.compressionPerLevel()).isEmpty();
       List<CompressionType> compressionTypeList =
           new ArrayList<>();
-      for (int i = 0; i < columnFamilyOptions.numLevels(); i++) {
+      for (int i = 0; i < options.numLevels(); i++) {
         compressionTypeList.add(CompressionType.NO_COMPRESSION);
       }
-      columnFamilyOptions.setCompressionPerLevel(compressionTypeList);
-      compressionTypeList = columnFamilyOptions.compressionPerLevel();
+      options.setCompressionPerLevel(compressionTypeList);
+      compressionTypeList = options.compressionPerLevel();
       for (final CompressionType compressionType : compressionTypeList) {
         assertThat(compressionType).isEqualTo(
             CompressionType.NO_COMPRESSION);
@@ -735,19 +715,18 @@ public class OptionsTest {
 
   @Test
   public void differentCompressionsPerLevel() {
-    try (final ColumnFamilyOptions columnFamilyOptions =
-             new ColumnFamilyOptions()) {
-      columnFamilyOptions.setNumLevels(3);
+    try (final Options options = new Options()) {
+      options.setNumLevels(3);
 
-      assertThat(columnFamilyOptions.compressionPerLevel()).isEmpty();
+      assertThat(options.compressionPerLevel()).isEmpty();
       List<CompressionType> compressionTypeList = new ArrayList<>();
 
       compressionTypeList.add(CompressionType.BZLIB2_COMPRESSION);
       compressionTypeList.add(CompressionType.SNAPPY_COMPRESSION);
       compressionTypeList.add(CompressionType.LZ4_COMPRESSION);
 
-      columnFamilyOptions.setCompressionPerLevel(compressionTypeList);
-      compressionTypeList = columnFamilyOptions.compressionPerLevel();
+      options.setCompressionPerLevel(compressionTypeList);
+      compressionTypeList = options.compressionPerLevel();
 
       assertThat(compressionTypeList.size()).isEqualTo(3);
       assertThat(compressionTypeList).
@@ -787,25 +766,11 @@ public class OptionsTest {
   }
 
   @Test
-  public void rateLimiterConfig() {
-    try (final Options options = new Options();
-         final Options anotherOptions = new Options()) {
-      final RateLimiterConfig rateLimiterConfig =
-          new GenericRateLimiterConfig(1000, 100 * 1000, 1);
-      options.setRateLimiterConfig(rateLimiterConfig);
-      // Test with parameter initialization
-
-      anotherOptions.setRateLimiterConfig(
-          new GenericRateLimiterConfig(1000));
-    }
-  }
-
-  @Test
   public void rateLimiter() {
     try (final Options options = new Options();
-         final Options anotherOptions = new Options()) {
-      final RateLimiter rateLimiter =
-          new RateLimiter(1000, 100 * 1000, 1);
+         final Options anotherOptions = new Options();
+         final RateLimiter rateLimiter =
+             new RateLimiter(1000, 100 * 1000, 1)) {
       options.setRateLimiter(rateLimiter);
       // Test with parameter initialization
       anotherOptions.setRateLimiter(
@@ -828,7 +793,6 @@ public class OptionsTest {
       options.useCappedPrefixExtractor(10);
     }
   }
-
 
   @Test
   public void shouldTestMemTableFactoryName()

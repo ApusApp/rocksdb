@@ -16,7 +16,7 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
 #include "table/iterator_wrapper.h"
-#include "table/merger.h"
+#include "table/merging_iterator.h"
 #include "util/string_util.h"
 #include "util/sync_point.h"
 #include "util/testharness.h"
@@ -1128,6 +1128,26 @@ TEST_F(DBIteratorTest, DBIterator5) {
     ASSERT_EQ(db_iter->value().ToString(), "put_1,merge_4,merge_5,merge_6");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+  }
+
+  {
+    // put, singledelete, merge
+    TestIterator* internal_iter = new TestIterator(BytewiseComparator());
+    internal_iter->AddPut("a", "val_a");
+    internal_iter->AddSingleDeletion("a");
+    internal_iter->AddMerge("a", "merge_1");
+    internal_iter->AddMerge("a", "merge_2");
+    internal_iter->AddPut("b", "val_b");
+    internal_iter->Finish();
+    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+        env_, ImmutableCFOptions(options), BytewiseComparator(), internal_iter,
+        10, options.max_sequential_skip_in_iterations, 0));
+    db_iter->Seek("b");
+    ASSERT_TRUE(db_iter->Valid());
+    ASSERT_EQ(db_iter->key().ToString(), "b");
+    db_iter->Prev();
+    ASSERT_TRUE(db_iter->Valid());
+    ASSERT_EQ(db_iter->key().ToString(), "a");
   }
 }
 

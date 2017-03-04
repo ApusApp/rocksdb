@@ -455,9 +455,8 @@ public interface ColumnFamilyOptionsInterface {
    * @param multiplier the ratio between the total size of level-(L+1)
    *     files and the total size of level-L files for all L.
    * @return the reference to the current option.
-   * @see #setMaxBytesForLevelBase(long)
    */
-  Object setMaxBytesForLevelMultiplier(int multiplier);
+  Object setMaxBytesForLevelMultiplier(double multiplier);
 
   /**
    * The ratio between the total size of level-(L+1) files and the total
@@ -466,9 +465,8 @@ public interface ColumnFamilyOptionsInterface {
    *
    * @return the ratio between the total size of level-(L+1) files and
    *     the total size of level-L files for all L.
-   * @see #maxBytesForLevelBase()
    */
-  int maxBytesForLevelMultiplier();
+  double maxBytesForLevelMultiplier();
 
   /**
    * Maximum size of each compaction (not guarantee)
@@ -700,33 +698,6 @@ public interface ColumnFamilyOptionsInterface {
    * @see #setBloomLocality(int)
    */
   int bloomLocality();
-
-  /**
-   * The number of partial merge operands to accumulate before partial
-   * merge will be performed. Partial merge will not be called
-   * if the list of values to merge is less than min_partial_merge_operands.
-   *
-   * If min_partial_merge_operands &lt; 2, then it will be treated as 2.
-   *
-   * Default: 2
-   *
-   * @param minPartialMergeOperands min partial merge operands
-   * @return the reference to the current option.
-   */
-  Object setMinPartialMergeOperands(int minPartialMergeOperands);
-
-  /**
-   * The number of partial merge operands to accumulate before partial
-   * merge will be performed. Partial merge will not be called
-   * if the list of values to merge is less than min_partial_merge_operands.
-   *
-   * If min_partial_merge_operands &lt; 2, then it will be treated as 2.
-   *
-   * Default: 2
-   *
-   * @return min partial merge operands
-   */
-  int minPartialMergeOperands();
 
   /**
    * <p>This flag specifies that the implementation should optimize the filters
